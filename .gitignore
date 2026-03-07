@@ -1,0 +1,11 @@
+build/
+wasm/
+node_modules/
+*.o
+*.so
+*.dylib
+PLAN.md
+CLAUDE.md
+.claude/
+__pycache__/
+*.pyc
