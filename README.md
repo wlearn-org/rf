@@ -429,7 +429,7 @@ make
 Requires Emscripten.
 
 ```bash
-bash scripts/build-wasm.sh        # outputs wasm/rf.cjs
+bash scripts/build-wasm.sh        # outputs wasm/rf.js
 bash scripts/verify-exports.sh    # verifies 20 exports
 ```
 

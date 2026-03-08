@@ -9,7 +9,7 @@ async function loadRF(options = {}) {
 
   loading = (async () => {
     // SINGLE_FILE=1: .wasm is embedded in the .js file, no locateFile needed
-    const createRF = require('../wasm/rf.cjs')
+    const createRF = require('../wasm/rf.js')
     wasmModule = await createRF(options)
     return wasmModule
   })()
