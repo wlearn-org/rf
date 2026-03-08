@@ -1,10 +1,10 @@
-import { getWasm, loadRF } from './wasm.js'
-import {
+const { getWasm, loadRF } = require('./wasm.js')
+const {
   normalizeX, normalizeY,
   encodeBundle, decodeBundle,
   register,
   DisposedError, NotFittedError
-} from '@wlearn/core'
+} = require('@wlearn/core')
 
 // FinalizationRegistry safety net -- warns if dispose() was never called
 const leakRegistry = typeof FinalizationRegistry !== 'undefined'
@@ -55,7 +55,7 @@ const LOAD_SENTINEL = Symbol('load')
 
 // --- RFModel ---
 
-export class RFModel {
+class RFModel {
   #handle = null
   #freed = false
   #ptrRef = null
@@ -448,3 +448,5 @@ export class RFModel {
 
 register('wlearn.rf.classifier@1', (m, t, b) => RFModel._fromBundle(m, t, b))
 register('wlearn.rf.regressor@1', (m, t, b) => RFModel._fromBundle(m, t, b))
+
+module.exports = { RFModel }

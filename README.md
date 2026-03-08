@@ -51,7 +51,7 @@ make
 ### JavaScript
 
 ```js
-import { RFModel } from '@wlearn/rf'
+const { RFModel } = require('@wlearn/rf')
 
 // Classification
 const clf = await RFModel.create({ nEstimators: 100, seed: 42 })

@@ -2,10 +2,10 @@
   "name": "@wlearn/rf",
   "version": "0.1.0",
   "description": "Random Forest from scratch in C11, compiled to WebAssembly -- classification, regression, ExtraTrees, OOB scoring, MDI feature importances",
-  "type": "module",
+  "type": "commonjs",
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": { "require": "./src/index.js", "default": "./src/index.js" }
   },
   "files": [
     "src/",

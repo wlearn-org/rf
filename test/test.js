@@ -1,9 +1,3 @@
-import { fileURLToPath } from 'url'
-import { dirname } from 'path'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
 let passed = 0
 let failed = 0
 
@@ -67,12 +61,14 @@ function makeRegressionData(rng, nSamples, nFeatures) {
   return { X, y }
 }
 
+async function main() {
+
 // ============================================================
 // WASM loading
 // ============================================================
 console.log('\n=== WASM Loading ===')
 
-const { loadRF } = await import('../src/wasm.js')
+const { loadRF } = require('../src/wasm.js')
 const wasm = await loadRF()
 
 await test('WASM module loads', async () => {
@@ -90,7 +86,7 @@ await test('get_last_error returns string', async () => {
 // ============================================================
 console.log('\n=== RFModel ===')
 
-const { RFModel } = await import('../src/model.js')
+const { RFModel } = require('../src/model.js')
 
 await test('create() returns model', async () => {
   const model = await RFModel.create({ nEstimators: 10 })
@@ -458,7 +454,7 @@ await test('Regression save/load round-trip', async () => {
 })
 
 await test('Bundle blob has RF01 header', async () => {
-  const { decodeBundle } = await import('@wlearn/core')
+  const { decodeBundle } = require('@wlearn/core')
 
   const rng = makeLCG(802)
   const { X, y } = makeClassificationData(rng, 20, 2)
@@ -511,7 +507,7 @@ await test('Feature importances preserved after load', async () => {
 })
 
 await test('Regressor bundle typeId', async () => {
-  const { decodeBundle } = await import('@wlearn/core')
+  const { decodeBundle } = require('@wlearn/core')
 
   const rng = makeLCG(804)
   const { X, y } = makeRegressionData(rng, 20, 2)
@@ -808,3 +804,7 @@ await test('Same seed produces identical models across create() calls', async ()
 // ============================================================
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`)
 if (failed > 0) process.exit(1)
+
+}
+
+main()
