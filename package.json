@@ -39,5 +39,9 @@
     "wlearn"
   ],
   "author": "Anton Zemlyansky",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wlearn-org/rf.git"
+  },
   "license": "Apache-2.0"
 }
