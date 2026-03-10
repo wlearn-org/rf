@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0] - 2026-03-10
+
+### Changed
+
+- Wrap RFModel with `createModelClass` for unified task detection
+- `task` parameter (`'classification'` or `'regression'`) is now auto-detected from labels if omitted
+
 ## [0.2.0] - 2026-03-03
 
 ### Added
