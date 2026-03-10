@@ -1,10 +1,13 @@
 const { loadRF, getWasm } = require('./wasm.js')
-const { RFModel } = require('./model.js')
+const { RFModel: RFModelImpl } = require('./model.js')
+const { createModelClass } = require('@wlearn/core')
+
+const RFModel = createModelClass(RFModelImpl, RFModelImpl, { name: 'RFModel', load: loadRF })
 
 // Convenience: create, fit, return fitted model
 async function train(params, X, y) {
   const model = await RFModel.create(params)
-  model.fit(X, y)
+  await model.fit(X, y)
   return model
 }
 
