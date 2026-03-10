@@ -1,5 +1,6 @@
 build/
 wasm/
+dist/
 node_modules/
 *.o
 *.so
@@ -9,3 +10,4 @@ CLAUDE.md
 .claude/
 __pycache__/
 *.pyc
+package-lock.json
