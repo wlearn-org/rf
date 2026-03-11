@@ -676,7 +676,7 @@ static void test_defaults_unchanged(void) {
 }
 
 static void test_v2_save_load(void) {
-    printf("=== V2 Save/Load ===\n");
+    printf("=== V3 Save/Load ===\n");
 
     int n = 80, d = 2;
     double *X = (double *)malloc((size_t)n * d * sizeof(double));
@@ -704,7 +704,7 @@ static void test_v2_save_load(void) {
     /* Check version byte */
     uint32_t ver;
     memcpy(&ver, blob + 4, 4);
-    ASSERT(ver == 2, "saved format version == 2");
+    ASSERT(ver == 3, "saved format version == 3");
 
     rf_forest_t *loaded = rf_load(blob, blob_len);
     ASSERT(loaded != NULL, "v2 load succeeds");

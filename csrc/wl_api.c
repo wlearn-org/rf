@@ -30,7 +30,10 @@ rf_forest_t *wl_rf_fit(
     int heterogeneous,
     int oob_weighting,
     double alpha_trim,
-    int leaf_model
+    int leaf_model,
+    int store_leaf_samples,
+    const int32_t *monotonic_cst,
+    int n_monotonic_cst
 ) {
     rf_params_t params;
     rf_params_init(&params);
@@ -51,6 +54,9 @@ rf_forest_t *wl_rf_fit(
     params.oob_weighting = oob_weighting;
     params.alpha_trim = alpha_trim;
     params.leaf_model = leaf_model;
+    params.store_leaf_samples = store_leaf_samples;
+    params.monotonic_cst = (int32_t *)monotonic_cst;
+    params.n_monotonic_cst = n_monotonic_cst;
     return rf_fit(X, (int32_t)nrow, (int32_t)ncol, y, &params);
 }
 
@@ -128,4 +134,16 @@ double wl_rf_get_alpha_trim(const rf_forest_t *f) {
 
 int wl_rf_get_leaf_model(const rf_forest_t *f) {
     return f ? f->leaf_model : 0;
+}
+
+int wl_rf_predict_quantile(const rf_forest_t *f, const double *X, int nrow, int ncol,
+                           const double *quantiles, int n_quantiles, double *out) {
+    return rf_predict_quantile(f, X, (int32_t)nrow, (int32_t)ncol,
+                               quantiles, (int32_t)n_quantiles, out);
+}
+
+int wl_rf_predict_interval(const rf_forest_t *f, const double *X, int nrow, int ncol,
+                           double alpha, double *out_lower, double *out_upper) {
+    return rf_predict_interval(f, X, (int32_t)nrow, (int32_t)ncol,
+                               alpha, out_lower, out_upper);
 }

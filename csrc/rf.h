@@ -10,7 +10,11 @@
  * - MDI feature importance
  * - Cost-complexity pruning (alpha_trim)
  * - Local linear leaf models (regression)
- * - Binary serialization (RF01/RF02 format)
+ * - Missing value handling (learned NaN direction per split)
+ * - Monotonic constraints (bound propagation)
+ * - Quantile regression forests (leaf sample storage)
+ * - Conformal prediction intervals (J+ab via OOB residuals)
+ * - Binary serialization (RF01/RF02/RF03 format)
  */
 
 #ifndef RF_H
@@ -48,6 +52,7 @@ typedef struct {
     int32_t  n_samples;   /* samples reaching this node */
     double   impurity;    /* Gini (cls) or MSE (reg) */
     int32_t  leaf_idx;    /* index into leaf_data, -1 for internal */
+    int8_t   nan_dir;     /* NaN direction: 0=left, 1=right */
 } rf_node_t;
 
 /* ---------- Single decision tree ---------- */
@@ -59,6 +64,10 @@ typedef struct {
     double    *leaf_data;  /* cls: n_leaves * n_classes; reg: n_leaves */
     int32_t    n_leaves;
     int32_t    leaf_cap;
+    /* Quantile RF: per-leaf sample indices (CSR format) */
+    int32_t   *leaf_samples;   /* concatenated sample indices per leaf */
+    int32_t   *leaf_offsets;   /* offsets[leaf_id] .. offsets[leaf_id+1] */
+    int32_t    n_leaf_samples; /* total length of leaf_samples */
 } rf_tree_t;
 
 /* ---------- Forest ---------- */
@@ -89,6 +98,15 @@ typedef struct {
     int32_t    leaf_model;     /* 0=constant, 1=local linear (regression only) */
     double     sample_rate;    /* bootstrap/subsample fraction */
     double     alpha_trim;     /* cost-complexity pruning penalty */
+    /* v0.3 fields */
+    int32_t   *monotonic_cst; /* per-feature monotonic constraints (-1/0/+1), NULL if none */
+    int32_t    store_leaf_samples; /* 1 if quantile RF leaf storage is enabled */
+    /* Conformal: OOB residuals stored during fit */
+    double    *oob_predictions; /* per-training-sample OOB predictions, length n_train */
+    int32_t   *oob_counts;      /* per-training-sample OOB tree counts, length n_train */
+    int32_t    n_train;          /* number of training samples (for conformal) */
+    const double *y_train;       /* pointer to training labels (NOT owned, set during fit) */
+    double    *y_train_copy;     /* owned copy of training labels for conformal */
 } rf_forest_t;
 
 /* ---------- Hyperparameters ---------- */
@@ -110,9 +128,12 @@ typedef struct {
     int32_t  heterogeneous;      /* 0=off, 1=depth-dependent feature weighting */
     int32_t  oob_weighting;      /* 0=off, 1=weight trees by OOB performance */
     int32_t  leaf_model;         /* 0=constant, 1=local linear (regression only) */
-    int32_t  _reserved;          /* padding for double alignment */
+    int32_t  store_leaf_samples; /* 0=off, 1=on (enables quantile prediction) */
     double   sample_rate;        /* bootstrap/subsample fraction, default 1.0 */
     double   alpha_trim;         /* cost-complexity pruning penalty, default 0.0 */
+    /* v0.3 params */
+    int32_t *monotonic_cst;      /* per-feature constraints: -1=decreasing, 0=none, +1=increasing */
+    int32_t  n_monotonic_cst;    /* length of monotonic_cst array (must equal ncol) */
 } rf_params_t;
 
 /* ---------- Public API ---------- */
@@ -159,6 +180,32 @@ int rf_save(const rf_forest_t *forest, char **out_buf, int32_t *out_len);
 /* Deserialize forest from RF01 binary blob.
  * Returns NULL on error (check rf_get_error()). */
 rf_forest_t *rf_load(const char *buf, int32_t len);
+
+/* Predict quantiles (quantile regression forest).
+ * Requires store_leaf_samples=1 during fit.
+ * quantiles: array of quantile values in [0,1], length n_quantiles.
+ * out: float64 array of length nrow * n_quantiles, caller-allocated.
+ *   out[i * n_quantiles + q] = predicted quantile q for sample i.
+ * Returns 0 on success, -1 on error. */
+int rf_predict_quantile(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    const double *quantiles, int32_t n_quantiles,
+    double *out
+);
+
+/* Predict conformal intervals (Jackknife+-after-Bootstrap).
+ * Requires bootstrap=1, compute_oob=1 during fit.
+ * alpha: miscoverage rate (e.g. 0.1 for 90% intervals).
+ * out_lower, out_upper: float64 arrays of length nrow, caller-allocated.
+ * Returns 0 on success, -1 on error. */
+int rf_predict_interval(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    double alpha,
+    double *out_lower,
+    double *out_upper
+);
 
 /* Free forest and all owned memory. */
 void rf_free(rf_forest_t *forest);

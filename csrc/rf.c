@@ -10,7 +10,11 @@
  * - MDI feature importance (normalized)
  * - Cost-complexity pruning (alpha_trim)
  * - Local linear leaf models (regression)
- * - RF01/RF02 binary serialization
+ * - Missing value handling (learned NaN direction per split)
+ * - Monotonic constraints (bound propagation)
+ * - Quantile regression forests (leaf sample storage)
+ * - Conformal prediction intervals (J+ab via OOB residuals)
+ * - RF01/RF02/RF03 binary serialization
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -52,9 +56,11 @@ void rf_params_init(rf_params_t *p) {
     p->heterogeneous = 0;
     p->oob_weighting = 0;
     p->leaf_model = 0;
-    p->_reserved = 0;
+    p->store_leaf_samples = 0;
     p->sample_rate = 1.0;
     p->alpha_trim = 0.0;
+    p->monotonic_cst = NULL;
+    p->n_monotonic_cst = 0;
 }
 
 /* ---------- tree helpers ---------- */
@@ -68,6 +74,9 @@ static int tree_init(rf_tree_t *t, int32_t init_cap) {
     t->leaf_data = (double *)malloc((size_t)init_cap * sizeof(double));
     if (!t->leaf_data) { free(t->nodes); return -1; }
     t->n_leaves = 0;
+    t->leaf_samples = NULL;
+    t->leaf_offsets = NULL;
+    t->n_leaf_samples = 0;
     return 0;
 }
 
@@ -87,6 +96,7 @@ static int32_t tree_add_node(rf_tree_t *t) {
     t->nodes[idx].n_samples = 0;
     t->nodes[idx].impurity = 0.0;
     t->nodes[idx].leaf_idx = -1;
+    t->nodes[idx].nan_dir = 0;
     return idx;
 }
 
@@ -108,8 +118,12 @@ static int32_t tree_add_leaf(rf_tree_t *t, int32_t n_values) {
 static void tree_free(rf_tree_t *t) {
     free(t->nodes);
     free(t->leaf_data);
+    free(t->leaf_samples);
+    free(t->leaf_offsets);
     t->nodes = NULL;
     t->leaf_data = NULL;
+    t->leaf_samples = NULL;
+    t->leaf_offsets = NULL;
 }
 
 /* ---------- sorting ---------- */
@@ -298,6 +312,8 @@ typedef struct {
     int32_t criterion;
     int32_t heterogeneous;
     int32_t leaf_model;
+    int32_t store_leaf_samples;
+    const int32_t *monotonic_cst;  /* per-feature constraints, NULL if none */
     rf_rng_t *rng;
     double *importance;  /* accumulated raw importance, length n_features */
     /* HRF depth-usage tracking (shared across trees) */
@@ -310,6 +326,8 @@ typedef struct {
     double *cls_counts_l;  /* length n_classes */
     double *cls_counts_r;  /* length n_classes */
     int32_t *sample_indices_buf; /* for leaf_model: length nrow */
+    /* NaN scratch */
+    int32_t *nan_indices;  /* length nrow, temp storage for NaN sample indices */
 } build_ctx_t;
 
 /* ---------- find best split ---------- */
@@ -319,13 +337,47 @@ typedef struct {
     double threshold;
     double gain;
     int32_t split_pos;  /* number of samples going left */
+    int8_t nan_dir;     /* 0=NaN goes left, 1=NaN goes right */
 } split_result_t;
+
+/* Helper: compute gain for a cls split (works with NaN-augmented counts).
+ * Returns gain; caller compares against best. */
+static double cls_split_gain(const double *counts_l, const double *counts_r,
+                              int32_t n_classes, int32_t n_left, int32_t n_right,
+                              int32_t n_total, double parent_impurity, int32_t crit) {
+    if (crit == 2) {
+        return hellinger_gain(counts_l, counts_r, n_classes, n_left, n_right);
+    }
+    double imp_l = cls_impurity(counts_l, n_classes, n_left, crit);
+    double imp_r = cls_impurity(counts_r, n_classes, n_right, crit);
+    return parent_impurity
+        - ((double)n_left / n_total) * imp_l
+        - ((double)n_right / n_total) * imp_r;
+}
+
+/* Helper: check monotonic constraint on regression split.
+ * Returns 1 if valid, 0 if violates constraint. */
+static int mono_check(const int32_t *monotonic_cst, int32_t feat,
+                       double pred_left, double pred_right,
+                       double lower_bound, double upper_bound) {
+    if (!monotonic_cst) return 1;
+    int32_t cst = monotonic_cst[feat];
+    if (cst == 0) return 1;
+    /* Clip predictions to bounds */
+    if (pred_left < lower_bound) pred_left = lower_bound;
+    if (pred_left > upper_bound) pred_left = upper_bound;
+    if (pred_right < lower_bound) pred_right = lower_bound;
+    if (pred_right > upper_bound) pred_right = upper_bound;
+    if (cst > 0) return pred_left <= pred_right + 1e-12;
+    return pred_left >= pred_right - 1e-12;
+}
 
 static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                                        int32_t *sample_indices, int32_t n,
-                                       double parent_impurity, int32_t depth) {
+                                       double parent_impurity, int32_t depth,
+                                       double lower_bound, double upper_bound) {
     (void)tree;
-    split_result_t best = { -1, 0.0, -1.0, 0 };
+    split_result_t best = { -1, 0.0, -1.0, 0, 0 };
 
     /* Feature sampling: uniform or HRF-weighted */
     if (ctx->heterogeneous && ctx->depth_usage && ctx->hrf_weights) {
@@ -345,214 +397,335 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
     for (int32_t fi = 0; fi < ctx->max_features && fi < ctx->ncol; fi++) {
         int32_t feat = ctx->feature_buf[fi];
 
+        /* Separate NaN and non-NaN samples for this feature */
+        int32_t n_valid = 0, n_nan = 0;
+        for (int32_t i = 0; i < n; i++) {
+            double v = ctx->X[(size_t)sample_indices[i] * ctx->ncol + feat];
+            if (isnan(v)) {
+                ctx->nan_indices[n_nan++] = sample_indices[i];
+            } else {
+                ctx->idx_buf[n_valid++] = sample_indices[i];
+            }
+        }
+        /* If all NaN or all same, skip */
+        if (n_valid < 2) continue;
+
+        /* NaN statistics for classification */
+        double *nan_cls_counts = NULL;
+        double nan_sum = 0, nan_sumsq = 0;
+        if (n_nan > 0 && ctx->task == 0) {
+            nan_cls_counts = (double *)calloc((size_t)ctx->n_classes, sizeof(double));
+            for (int32_t i = 0; i < n_nan; i++) {
+                nan_cls_counts[(int32_t)ctx->y[ctx->nan_indices[i]]]++;
+            }
+        }
+        if (n_nan > 0 && ctx->task == 1) {
+            for (int32_t i = 0; i < n_nan; i++) {
+                double yv = ctx->y[ctx->nan_indices[i]];
+                nan_sum += yv;
+                nan_sumsq += yv * yv;
+            }
+        }
+
         if (ctx->extra_trees) {
-            /* ExtraTrees: random threshold in [min, max] */
+            /* ExtraTrees: random threshold in [min, max] of non-NaN values */
             double vmin = DBL_MAX, vmax = -DBL_MAX;
-            for (int32_t i = 0; i < n; i++) {
-                double v = ctx->X[(size_t)sample_indices[i] * ctx->ncol + feat];
+            for (int32_t i = 0; i < n_valid; i++) {
+                double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
                 if (v < vmin) vmin = v;
                 if (v > vmax) vmax = v;
             }
-            if (vmin >= vmax) continue;
+            if (vmin >= vmax) { free(nan_cls_counts); continue; }
 
             double thr = vmin + rf_rng_uniform(ctx->rng) * (vmax - vmin);
 
-            /* Count left/right */
-            int32_t n_left = 0;
-            if (ctx->task == 0) {
-                memset(ctx->cls_counts_l, 0, (size_t)ctx->n_classes * sizeof(double));
-                memset(ctx->cls_counts_r, 0, (size_t)ctx->n_classes * sizeof(double));
-                for (int32_t i = 0; i < n; i++) {
-                    double v = ctx->X[(size_t)sample_indices[i] * ctx->ncol + feat];
-                    int32_t c = (int32_t)ctx->y[sample_indices[i]];
-                    if (v <= thr) { ctx->cls_counts_l[c]++; n_left++; }
-                    else { ctx->cls_counts_r[c]++; }
-                }
-                int32_t n_right = n - n_left;
-                if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+            /* Try both NaN directions (or just one if no NaN) */
+            int nan_dirs = (n_nan > 0) ? 2 : 1;
+            for (int nd = 0; nd < nan_dirs; nd++) {
+                int8_t try_nan_dir = (int8_t)nd;  /* 0=left, 1=right */
+                int32_t n_left = 0;
 
-                double gain;
-                if (crit == 2) {
-                    gain = hellinger_gain(ctx->cls_counts_l, ctx->cls_counts_r,
-                                           ctx->n_classes, n_left, n_right);
+                if (ctx->task == 0) {
+                    memset(ctx->cls_counts_l, 0, (size_t)ctx->n_classes * sizeof(double));
+                    memset(ctx->cls_counts_r, 0, (size_t)ctx->n_classes * sizeof(double));
+
+                    for (int32_t i = 0; i < n_valid; i++) {
+                        double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
+                        int32_t c = (int32_t)ctx->y[ctx->idx_buf[i]];
+                        if (v <= thr) { ctx->cls_counts_l[c]++; n_left++; }
+                        else { ctx->cls_counts_r[c]++; }
+                    }
+                    /* Add NaN samples to chosen side */
+                    if (n_nan > 0 && nan_cls_counts) {
+                        if (try_nan_dir == 0) {
+                            for (int32_t c = 0; c < ctx->n_classes; c++)
+                                ctx->cls_counts_l[c] += nan_cls_counts[c];
+                            n_left += n_nan;
+                        } else {
+                            for (int32_t c = 0; c < ctx->n_classes; c++)
+                                ctx->cls_counts_r[c] += nan_cls_counts[c];
+                        }
+                    }
+                    int32_t n_right = n - n_left;
+                    if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+
+                    double gain = cls_split_gain(ctx->cls_counts_l, ctx->cls_counts_r,
+                                                  ctx->n_classes, n_left, n_right,
+                                                  n, parent_impurity, crit);
+                    if (gain > best.gain) {
+                        best.feature = feat;
+                        best.threshold = thr;
+                        best.gain = gain;
+                        best.split_pos = n_left;
+                        best.nan_dir = try_nan_dir;
+                    }
                 } else {
-                    double imp_l = cls_impurity(ctx->cls_counts_l, ctx->n_classes, n_left, crit);
-                    double imp_r = cls_impurity(ctx->cls_counts_r, ctx->n_classes, n_right, crit);
-                    gain = parent_impurity
+                    /* Regression */
+                    double sum_l = 0, sum_r = 0;
+                    for (int32_t i = 0; i < n_valid; i++) {
+                        double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
+                        if (v <= thr) { sum_l += ctx->y[ctx->idx_buf[i]]; n_left++; }
+                        else { sum_r += ctx->y[ctx->idx_buf[i]]; }
+                    }
+                    if (n_nan > 0) {
+                        if (try_nan_dir == 0) { sum_l += nan_sum; n_left += n_nan; }
+                        else { sum_r += nan_sum; }
+                    }
+                    int32_t n_right = n - n_left;
+                    if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+
+                    double mean_l = sum_l / n_left;
+                    double mean_r = sum_r / n_right;
+
+                    /* Check monotonic constraint */
+                    if (!mono_check(ctx->monotonic_cst, feat, mean_l, mean_r,
+                                     lower_bound, upper_bound)) continue;
+
+                    double imp_l = 0, imp_r = 0;
+                    if (crit == 1) {
+                        for (int32_t i = 0; i < n_valid; i++) {
+                            double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
+                            double yv = ctx->y[ctx->idx_buf[i]];
+                            if (v <= thr) imp_l += fabs(yv - mean_l);
+                            else imp_r += fabs(yv - mean_r);
+                        }
+                        if (n_nan > 0) {
+                            for (int32_t i = 0; i < n_nan; i++) {
+                                double yv = ctx->y[ctx->nan_indices[i]];
+                                if (try_nan_dir == 0) imp_l += fabs(yv - mean_l);
+                                else imp_r += fabs(yv - mean_r);
+                            }
+                        }
+                        imp_l /= n_left;
+                        imp_r /= n_right;
+                    } else {
+                        for (int32_t i = 0; i < n_valid; i++) {
+                            double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
+                            double yv = ctx->y[ctx->idx_buf[i]];
+                            if (v <= thr) { double d = yv - mean_l; imp_l += d * d; }
+                            else { double d = yv - mean_r; imp_r += d * d; }
+                        }
+                        if (n_nan > 0) {
+                            for (int32_t i = 0; i < n_nan; i++) {
+                                double yv = ctx->y[ctx->nan_indices[i]];
+                                if (try_nan_dir == 0) { double d = yv - mean_l; imp_l += d * d; }
+                                else { double d = yv - mean_r; imp_r += d * d; }
+                            }
+                        }
+                        imp_l /= n_left;
+                        imp_r /= n_right;
+                    }
+
+                    double gain = parent_impurity
                         - ((double)n_left / n) * imp_l
                         - ((double)n_right / n) * imp_r;
-                }
-                if (gain > best.gain) {
-                    best.feature = feat;
-                    best.threshold = thr;
-                    best.gain = gain;
-                    best.split_pos = n_left;
-                }
-            } else {
-                /* Regression: compute left/right sums */
-                double sum_l = 0, sum_r = 0, absdev_l = 0, absdev_r = 0;
-                for (int32_t i = 0; i < n; i++) {
-                    double v = ctx->X[(size_t)sample_indices[i] * ctx->ncol + feat];
-                    if (v <= thr) { sum_l += ctx->y[sample_indices[i]]; n_left++; }
-                    else { sum_r += ctx->y[sample_indices[i]]; }
-                }
-                int32_t n_right = n - n_left;
-                if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
-
-                double mean_l = sum_l / n_left;
-                double mean_r = sum_r / n_right;
-                double imp_l = 0, imp_r = 0;
-
-                if (crit == 1) {
-                    /* MAE */
-                    for (int32_t i = 0; i < n; i++) {
-                        double v = ctx->X[(size_t)sample_indices[i] * ctx->ncol + feat];
-                        double yv = ctx->y[sample_indices[i]];
-                        if (v <= thr) { absdev_l += fabs(yv - mean_l); }
-                        else { absdev_r += fabs(yv - mean_r); }
+                    if (gain > best.gain) {
+                        best.feature = feat;
+                        best.threshold = thr;
+                        best.gain = gain;
+                        best.split_pos = n_left;
+                        best.nan_dir = try_nan_dir;
                     }
-                    imp_l = absdev_l / n_left;
-                    imp_r = absdev_r / n_right;
-                } else {
-                    /* MSE */
-                    for (int32_t i = 0; i < n; i++) {
-                        double v = ctx->X[(size_t)sample_indices[i] * ctx->ncol + feat];
-                        double yv = ctx->y[sample_indices[i]];
-                        if (v <= thr) { double d = yv - mean_l; imp_l += d * d; }
-                        else { double d = yv - mean_r; imp_r += d * d; }
-                    }
-                    imp_l /= n_left;
-                    imp_r /= n_right;
-                }
-
-                double gain = parent_impurity
-                    - ((double)n_left / n) * imp_l
-                    - ((double)n_right / n) * imp_r;
-                if (gain > best.gain) {
-                    best.feature = feat;
-                    best.threshold = thr;
-                    best.gain = gain;
-                    best.split_pos = n_left;
                 }
             }
         } else {
-            /* Standard: sort and try all midpoints */
-            memcpy(ctx->idx_buf, sample_indices, (size_t)n * sizeof(int32_t));
-            sort_indices_by_feature(ctx->idx_buf, n, ctx->X, ctx->ncol, feat, ctx->val_buf);
+            /* Standard: sort non-NaN and try all midpoints */
+            sort_indices_by_feature(ctx->idx_buf, n_valid, ctx->X, ctx->ncol, feat, ctx->val_buf);
+
+            /* Try both NaN directions for each candidate split.
+             * For efficiency, pre-compute NaN stats and add them in. */
+            int nan_dirs = (n_nan > 0) ? 2 : 1;
 
             if (ctx->task == 0) {
-                /* Classification: incremental counts */
-                memset(ctx->cls_counts_l, 0, (size_t)ctx->n_classes * sizeof(double));
-                memset(ctx->cls_counts_r, 0, (size_t)ctx->n_classes * sizeof(double));
+                /* Classification: incremental counts on non-NaN, then try NaN directions */
+                double *base_counts_l = ctx->cls_counts_l;
+                double *base_counts_r = ctx->cls_counts_r;
+                memset(base_counts_l, 0, (size_t)ctx->n_classes * sizeof(double));
+                memset(base_counts_r, 0, (size_t)ctx->n_classes * sizeof(double));
 
-                for (int32_t i = 0; i < n; i++) {
+                for (int32_t i = 0; i < n_valid; i++) {
                     int32_t c = (int32_t)ctx->y[ctx->idx_buf[i]];
-                    ctx->cls_counts_r[c]++;
+                    base_counts_r[c]++;
                 }
 
-                for (int32_t i = 0; i < n - 1; i++) {
+                for (int32_t i = 0; i < n_valid - 1; i++) {
                     int32_t c = (int32_t)ctx->y[ctx->idx_buf[i]];
-                    ctx->cls_counts_l[c]++;
-                    ctx->cls_counts_r[c]--;
-                    int32_t n_left = i + 1;
-                    int32_t n_right = n - n_left;
+                    base_counts_l[c]++;
+                    base_counts_r[c]--;
+                    int32_t base_left = i + 1;
+                    (void)(n_valid - base_left); /* base_right computed via n - n_left */
 
                     double v_cur = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
                     double v_next = ctx->X[(size_t)ctx->idx_buf[i + 1] * ctx->ncol + feat];
                     if (v_cur == v_next) continue;
 
-                    if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+                    for (int nd = 0; nd < nan_dirs; nd++) {
+                        int8_t try_nan_dir = (int8_t)nd;
+                        int32_t n_left = base_left + (try_nan_dir == 0 ? n_nan : 0);
+                        int32_t n_right = n - n_left;
 
-                    double gain;
-                    if (crit == 2) {
-                        gain = hellinger_gain(ctx->cls_counts_l, ctx->cls_counts_r,
-                                               ctx->n_classes, n_left, n_right);
-                    } else {
-                        double imp_l = cls_impurity(ctx->cls_counts_l, ctx->n_classes, n_left, crit);
-                        double imp_r = cls_impurity(ctx->cls_counts_r, ctx->n_classes, n_right, crit);
-                        gain = parent_impurity
-                            - ((double)n_left / n) * imp_l
-                            - ((double)n_right / n) * imp_r;
-                    }
+                        if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
 
-                    if (gain > best.gain) {
-                        best.feature = feat;
-                        best.threshold = (v_cur + v_next) * 0.5;
-                        best.gain = gain;
-                        best.split_pos = n_left;
+                        /* Temporarily add NaN counts for gain computation */
+                        double gain;
+                        if (n_nan > 0 && nan_cls_counts) {
+                            /* Allocate temp counts -- use stack for small n_classes */
+                            double tmp_l[64], tmp_r[64];
+                            double *cl = (ctx->n_classes <= 64) ? tmp_l : (double *)malloc((size_t)ctx->n_classes * sizeof(double));
+                            double *cr = (ctx->n_classes <= 64) ? tmp_r : (double *)malloc((size_t)ctx->n_classes * sizeof(double));
+                            for (int32_t cc = 0; cc < ctx->n_classes; cc++) {
+                                cl[cc] = base_counts_l[cc];
+                                cr[cc] = base_counts_r[cc];
+                            }
+                            if (try_nan_dir == 0) {
+                                for (int32_t cc = 0; cc < ctx->n_classes; cc++) cl[cc] += nan_cls_counts[cc];
+                            } else {
+                                for (int32_t cc = 0; cc < ctx->n_classes; cc++) cr[cc] += nan_cls_counts[cc];
+                            }
+                            gain = cls_split_gain(cl, cr, ctx->n_classes, n_left, n_right,
+                                                   n, parent_impurity, crit);
+                            if (ctx->n_classes > 64) { free(cl); free(cr); }
+                        } else {
+                            gain = cls_split_gain(base_counts_l, base_counts_r,
+                                                   ctx->n_classes, n_left, n_right,
+                                                   n, parent_impurity, crit);
+                        }
+
+                        /* Monotonic constraint check for binary classification:
+                         * use P(class=1) as the prediction value */
+                        if (ctx->monotonic_cst && ctx->n_classes == 2) {
+                            double p1_l, p1_r;
+                            if (n_nan > 0 && nan_cls_counts) {
+                                double cnt1_l = base_counts_l[1] + (try_nan_dir == 0 ? nan_cls_counts[1] : 0);
+                                double cnt1_r = base_counts_r[1] + (try_nan_dir == 1 ? nan_cls_counts[1] : 0);
+                                p1_l = cnt1_l / n_left;
+                                p1_r = cnt1_r / n_right;
+                            } else {
+                                p1_l = base_counts_l[1] / n_left;
+                                p1_r = base_counts_r[1] / n_right;
+                            }
+                            if (!mono_check(ctx->monotonic_cst, feat, p1_l, p1_r,
+                                             lower_bound, upper_bound)) continue;
+                        }
+
+                        if (gain > best.gain) {
+                            best.feature = feat;
+                            best.threshold = (v_cur + v_next) * 0.5;
+                            best.gain = gain;
+                            best.split_pos = n_left;
+                            best.nan_dir = try_nan_dir;
+                        }
                     }
                 }
             } else {
-                /* Regression: incremental sums */
-                double sum_all = 0, sumsq_all = 0, absdev_all = 0;
-                for (int32_t i = 0; i < n; i++) {
+                /* Regression: incremental sums on non-NaN */
+                double sum_all = 0, sumsq_all = 0;
+                for (int32_t i = 0; i < n_valid; i++) {
                     double yv = ctx->y[ctx->idx_buf[i]];
                     sum_all += yv;
                     sumsq_all += yv * yv;
                 }
 
                 double sum_l = 0, sumsq_l = 0;
-                /* For MAE: track running absolute deviations (recompute with known means) */
 
-                for (int32_t i = 0; i < n - 1; i++) {
+                for (int32_t i = 0; i < n_valid - 1; i++) {
                     double yv = ctx->y[ctx->idx_buf[i]];
                     sum_l += yv;
                     sumsq_l += yv * yv;
-                    int32_t n_left = i + 1;
-                    int32_t n_right = n - n_left;
+                    int32_t base_left = i + 1;
+                    (void)(n_valid - base_left); /* base_right computed via n - n_left */
 
                     double v_cur = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
                     double v_next = ctx->X[(size_t)ctx->idx_buf[i + 1] * ctx->ncol + feat];
                     if (v_cur == v_next) continue;
 
-                    if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+                    for (int nd = 0; nd < nan_dirs; nd++) {
+                        int8_t try_nan_dir = (int8_t)nd;
+                        int32_t n_left = base_left + (try_nan_dir == 0 ? n_nan : 0);
+                        int32_t n_right = n - n_left;
 
-                    double gain;
-                    if (crit == 1) {
-                        /* MAE: must compute full pass for absolute deviations */
-                        double mean_l = sum_l / n_left;
-                        double sum_r = sum_all - sum_l;
-                        double mean_r = sum_r / n_right;
-                        double mad_l = 0, mad_r = 0;
-                        for (int32_t j = 0; j < n_left; j++) {
-                            mad_l += fabs(ctx->y[ctx->idx_buf[j]] - mean_l);
+                        if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+
+                        /* Compute means with NaN samples added */
+                        double eff_sum_l = sum_l + (try_nan_dir == 0 ? nan_sum : 0);
+                        double eff_sum_r = (sum_all - sum_l) + (try_nan_dir == 1 ? nan_sum : 0);
+                        double mean_l = eff_sum_l / n_left;
+                        double mean_r = eff_sum_r / n_right;
+
+                        /* Check monotonic constraint */
+                        if (!mono_check(ctx->monotonic_cst, feat, mean_l, mean_r,
+                                         lower_bound, upper_bound)) continue;
+
+                        double gain;
+                        if (crit == 1) {
+                            /* MAE: must compute full pass */
+                            double mad_l = 0, mad_r = 0;
+                            for (int32_t j = 0; j <= i; j++) {
+                                mad_l += fabs(ctx->y[ctx->idx_buf[j]] - mean_l);
+                            }
+                            for (int32_t j = i + 1; j < n_valid; j++) {
+                                mad_r += fabs(ctx->y[ctx->idx_buf[j]] - mean_r);
+                            }
+                            if (n_nan > 0) {
+                                for (int32_t j = 0; j < n_nan; j++) {
+                                    double nyv = ctx->y[ctx->nan_indices[j]];
+                                    if (try_nan_dir == 0) mad_l += fabs(nyv - mean_l);
+                                    else mad_r += fabs(nyv - mean_r);
+                                }
+                            }
+                            mad_l /= n_left;
+                            mad_r /= n_right;
+                            gain = parent_impurity
+                                - ((double)n_left / n) * mad_l
+                                - ((double)n_right / n) * mad_r;
+                        } else {
+                            /* MSE: incremental for non-NaN, add NaN contribution */
+                            double eff_sumsq_l = sumsq_l + (try_nan_dir == 0 ? nan_sumsq : 0);
+                            double total_sumsq = sumsq_all + nan_sumsq;
+                            double eff_sumsq_r = total_sumsq - eff_sumsq_l;
+
+                            double mse_l = eff_sumsq_l / n_left - mean_l * mean_l;
+                            double mse_r = eff_sumsq_r / n_right - mean_r * mean_r;
+                            if (mse_l < 0) mse_l = 0;
+                            if (mse_r < 0) mse_r = 0;
+
+                            gain = parent_impurity
+                                - ((double)n_left / n) * mse_l
+                                - ((double)n_right / n) * mse_r;
                         }
-                        for (int32_t j = n_left; j < n; j++) {
-                            mad_r += fabs(ctx->y[ctx->idx_buf[j]] - mean_r);
+
+                        if (gain > best.gain) {
+                            best.feature = feat;
+                            best.threshold = (v_cur + v_next) * 0.5;
+                            best.gain = gain;
+                            best.split_pos = n_left;
+                            best.nan_dir = try_nan_dir;
                         }
-                        mad_l /= n_left;
-                        mad_r /= n_right;
-                        gain = parent_impurity
-                            - ((double)n_left / n) * mad_l
-                            - ((double)n_right / n) * mad_r;
-                    } else {
-                        /* MSE: incremental */
-                        double mean_l = sum_l / n_left;
-                        double mse_l = sumsq_l / n_left - mean_l * mean_l;
-
-                        double sum_r = sum_all - sum_l;
-                        double sumsq_r = sumsq_all - sumsq_l;
-                        double mean_r = sum_r / n_right;
-                        double mse_r = sumsq_r / n_right - mean_r * mean_r;
-
-                        if (mse_l < 0) mse_l = 0;
-                        if (mse_r < 0) mse_r = 0;
-
-                        gain = parent_impurity
-                            - ((double)n_left / n) * mse_l
-                            - ((double)n_right / n) * mse_r;
-                    }
-
-                    if (gain > best.gain) {
-                        best.feature = feat;
-                        best.threshold = (v_cur + v_next) * 0.5;
-                        best.gain = gain;
-                        best.split_pos = n_left;
                     }
                 }
-                (void)absdev_all;
             }
         }
+        free(nan_cls_counts);
     }
     return best;
 }
@@ -654,7 +827,8 @@ static void fit_leaf_linear(build_ctx_t *ctx, const int32_t *sample_indices, int
 }
 
 static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
-                           int32_t *sample_indices, int32_t n, int32_t depth) {
+                           int32_t *sample_indices, int32_t n, int32_t depth,
+                           double lower_bound, double upper_bound) {
     int32_t node_idx = tree_add_node(tree);
     if (node_idx < 0) return -1;
 
@@ -669,7 +843,6 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
             counts[(int32_t)ctx->y[sample_indices[i]]]++;
         }
         if (ctx->criterion == 2) {
-            /* Hellinger: no meaningful parent impurity, use gini for purity check */
             parent_impurity = gini_impurity(counts, ctx->n_classes, n);
         } else {
             parent_impurity = cls_impurity(counts, ctx->n_classes, n, ctx->criterion);
@@ -683,12 +856,13 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
     int make_leaf = 0;
     if (n < ctx->min_samples_split) make_leaf = 1;
     if (ctx->max_depth > 0 && depth >= ctx->max_depth) make_leaf = 1;
-    if (parent_impurity <= 1e-15) make_leaf = 1;  /* pure node */
+    if (parent_impurity <= 1e-15) make_leaf = 1;
     if (ctx->max_leaf_nodes > 0 && tree->n_leaves >= ctx->max_leaf_nodes) make_leaf = 1;
 
     if (!make_leaf) {
         split_result_t split = find_best_split(ctx, tree, sample_indices, n,
-                                                parent_impurity, depth);
+                                                parent_impurity, depth,
+                                                lower_bound, upper_bound);
 
         if (split.feature < 0 || split.gain <= 0.0) {
             make_leaf = 1;
@@ -702,13 +876,21 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
                 ctx->depth_usage[(size_t)d_idx * ctx->ncol + split.feature] += split.gain;
             }
 
-            /* Partition samples */
+            /* Partition samples: left = (v <= thr || (isnan(v) && nan_dir==0)),
+             * right = (v > thr || (isnan(v) && nan_dir==1)) */
             int32_t feat = split.feature;
             double thr = split.threshold;
+            int8_t nan_dir = split.nan_dir;
             int32_t lo = 0, hi = n - 1;
             while (lo <= hi) {
                 double v = ctx->X[(size_t)sample_indices[lo] * ctx->ncol + feat];
-                if (v <= thr) {
+                int go_left;
+                if (isnan(v)) {
+                    go_left = (nan_dir == 0);
+                } else {
+                    go_left = (v <= thr);
+                }
+                if (go_left) {
                     lo++;
                 } else {
                     int32_t tmp = sample_indices[lo];
@@ -725,9 +907,54 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
             } else {
                 tree->nodes[node_idx].feature = feat;
                 tree->nodes[node_idx].threshold = thr;
+                tree->nodes[node_idx].nan_dir = nan_dir;
 
-                int32_t left = build_node(ctx, tree, sample_indices, n_left, depth + 1);
-                int32_t right = build_node(ctx, tree, sample_indices + n_left, n_right, depth + 1);
+                /* Compute child bounds for monotonic constraints */
+                double left_upper = upper_bound;
+                double left_lower = lower_bound;
+                double right_upper = upper_bound;
+                double right_lower = lower_bound;
+
+                if (ctx->monotonic_cst) {
+                    int32_t cst = ctx->monotonic_cst[feat];
+                    if (cst != 0) {
+                        /* Compute child prediction values for bounding.
+                         * Regression: mean of y. Classification (binary): P(class=1). */
+                        double pred_l, pred_r;
+                        if (ctx->task == 0 && ctx->n_classes == 2) {
+                            double cnt1_l = 0, cnt1_r = 0;
+                            for (int32_t i = 0; i < n_left; i++)
+                                cnt1_l += (ctx->y[sample_indices[i]] == 1.0);
+                            for (int32_t i = n_left; i < n; i++)
+                                cnt1_r += (ctx->y[sample_indices[i]] == 1.0);
+                            pred_l = cnt1_l / n_left;
+                            pred_r = cnt1_r / n_right;
+                        } else {
+                            double sum_l = 0, sum_r = 0;
+                            for (int32_t i = 0; i < n_left; i++)
+                                sum_l += ctx->y[sample_indices[i]];
+                            for (int32_t i = n_left; i < n; i++)
+                                sum_r += ctx->y[sample_indices[i]];
+                            pred_l = sum_l / n_left;
+                            pred_r = sum_r / n_right;
+                        }
+                        double mid = (pred_l + pred_r) * 0.5;
+                        if (cst > 0) {
+                            /* Increasing: left <= mid <= right */
+                            left_upper = fmin(upper_bound, mid);
+                            right_lower = fmax(lower_bound, mid);
+                        } else {
+                            /* Decreasing: left >= mid >= right */
+                            left_lower = fmax(lower_bound, mid);
+                            right_upper = fmin(upper_bound, mid);
+                        }
+                    }
+                }
+
+                int32_t left = build_node(ctx, tree, sample_indices, n_left,
+                                           depth + 1, left_lower, left_upper);
+                int32_t right = build_node(ctx, tree, sample_indices + n_left, n_right,
+                                            depth + 1, right_lower, right_upper);
 
                 if (left < 0 || right < 0) return -1;
 
@@ -751,8 +978,17 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
         for (int32_t i = 0; i < n; i++) {
             leaf[(int32_t)ctx->y[sample_indices[i]]]++;
         }
+        /* Clip class probabilities to monotonic bounds (binary classification).
+         * Bounds are in [0,1] probability space for class 1. */
+        if (ctx->monotonic_cst && ctx->n_classes == 2 && n > 0) {
+            double total = leaf[0] + leaf[1];
+            double p1 = leaf[1] / total;
+            if (p1 < lower_bound) p1 = lower_bound;
+            if (p1 > upper_bound) p1 = upper_bound;
+            leaf[1] = p1 * total;
+            leaf[0] = (1.0 - p1) * total;
+        }
     } else if (ctx->leaf_model == 1) {
-        /* Local linear leaf: store [intercept, coef_0, ..., coef_{ncol-1}] */
         int32_t lm_size = ctx->ncol + 1;
         int32_t leaf_idx = tree_add_leaf(tree, lm_size);
         if (leaf_idx < 0) return -1;
@@ -765,7 +1001,11 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
 
         double mean = 0.0;
         for (int32_t i = 0; i < n; i++) mean += ctx->y[sample_indices[i]];
-        tree->leaf_data[leaf_idx] = mean / n;
+        double pred = mean / n;
+        /* Clip to monotonic bounds */
+        if (pred < lower_bound) pred = lower_bound;
+        if (pred > upper_bound) pred = upper_bound;
+        tree->leaf_data[leaf_idx] = pred;
     }
 
     return node_idx;
@@ -889,17 +1129,28 @@ static void subsample_no_replace(int32_t *indices, int32_t *counts, int32_t nrow
 
 /* ---------- predict single sample through one tree ---------- */
 
-static double predict_tree_reg(const rf_tree_t *tree, const double *x, int32_t ncol,
-                                int32_t leaf_model) {
+/* Navigate tree handling NaN via learned nan_dir */
+static int32_t tree_leaf_idx(const rf_tree_t *tree, const double *x) {
     int32_t idx = 0;
     while (tree->nodes[idx].feature >= 0) {
         double v = x[tree->nodes[idx].feature];
-        idx = (v <= tree->nodes[idx].threshold) ? tree->nodes[idx].left : tree->nodes[idx].right;
+        if (isnan(v)) {
+            idx = (tree->nodes[idx].nan_dir == 0)
+                ? tree->nodes[idx].left : tree->nodes[idx].right;
+        } else {
+            idx = (v <= tree->nodes[idx].threshold)
+                ? tree->nodes[idx].left : tree->nodes[idx].right;
+        }
     }
+    return idx;
+}
+
+static double predict_tree_reg(const rf_tree_t *tree, const double *x, int32_t ncol,
+                                int32_t leaf_model) {
+    int32_t idx = tree_leaf_idx(tree, x);
     if (leaf_model == 1) {
-        /* Linear leaf: [intercept, coef_0, ..., coef_{ncol-1}] */
         const double *coefs = tree->leaf_data + tree->nodes[idx].leaf_idx;
-        double pred = coefs[0];  /* intercept */
+        double pred = coefs[0];
         for (int32_t j = 0; j < ncol; j++) {
             pred += coefs[j + 1] * x[j];
         }
@@ -910,11 +1161,7 @@ static double predict_tree_reg(const rf_tree_t *tree, const double *x, int32_t n
 
 static const double *predict_tree_cls(const rf_tree_t *tree, const double *x, int32_t ncol) {
     (void)ncol;
-    int32_t idx = 0;
-    while (tree->nodes[idx].feature >= 0) {
-        double v = x[tree->nodes[idx].feature];
-        idx = (v <= tree->nodes[idx].threshold) ? tree->nodes[idx].left : tree->nodes[idx].right;
-    }
+    int32_t idx = tree_leaf_idx(tree, x);
     return tree->leaf_data + tree->nodes[idx].leaf_idx;
 }
 
@@ -979,6 +1226,21 @@ rf_forest_t *rf_fit(
     forest->leaf_model = params->leaf_model;
     forest->sample_rate = params->sample_rate;
     forest->alpha_trim = params->alpha_trim;
+    forest->store_leaf_samples = params->store_leaf_samples;
+    forest->monotonic_cst = NULL;
+    forest->oob_predictions = NULL;
+    forest->oob_counts = NULL;
+    forest->n_train = 0;
+    forest->y_train = NULL;
+    forest->y_train_copy = NULL;
+
+    /* Copy monotonic constraints if provided */
+    if (params->monotonic_cst && params->n_monotonic_cst == ncol) {
+        forest->monotonic_cst = (int32_t *)malloc((size_t)ncol * sizeof(int32_t));
+        if (forest->monotonic_cst) {
+            memcpy(forest->monotonic_cst, params->monotonic_cst, (size_t)ncol * sizeof(int32_t));
+        }
+    }
 
     forest->trees = (rf_tree_t *)calloc((size_t)forest->n_trees, sizeof(rf_tree_t));
     forest->feature_importances = (double *)calloc((size_t)ncol, sizeof(double));
@@ -1004,6 +1266,7 @@ rf_forest_t *rf_fit(
     int32_t *feature_buf = (int32_t *)malloc((size_t)ncol * sizeof(int32_t));
     double *val_buf = (double *)malloc((size_t)nrow * sizeof(double));
     int32_t *idx_buf = (int32_t *)malloc((size_t)nrow * sizeof(int32_t));
+    int32_t *nan_indices = (int32_t *)malloc((size_t)nrow * sizeof(int32_t));
     double *importance = (double *)calloc((size_t)ncol, sizeof(double));
 
     /* HRF depth usage tracking */
@@ -1046,10 +1309,10 @@ rf_forest_t *rf_fit(
         cls_counts_r = (double *)malloc((size_t)n_classes * sizeof(double));
     }
 
-    if (!boot_indices || !boot_counts || !feature_buf || !val_buf || !idx_buf || !importance) {
+    if (!boot_indices || !boot_counts || !feature_buf || !val_buf || !idx_buf || !nan_indices || !importance) {
         set_error("rf_fit: scratch allocation failed");
         free(boot_indices); free(boot_counts); free(feature_buf);
-        free(val_buf); free(idx_buf); free(importance);
+        free(val_buf); free(idx_buf); free(nan_indices); free(importance);
         free(depth_usage); free(hrf_weights);
         free(oob_pred); free(oob_count);
         free(tree_oob_pred); free(tree_oob_count);
@@ -1065,7 +1328,7 @@ rf_forest_t *rf_fit(
         if (tree_init(&forest->trees[t], 64) != 0) {
             set_error("rf_fit: tree init failed");
             free(boot_indices); free(boot_counts); free(feature_buf);
-            free(val_buf); free(idx_buf); free(importance);
+            free(val_buf); free(idx_buf); free(nan_indices); free(importance);
             free(depth_usage); free(hrf_weights);
             free(oob_pred); free(oob_count);
             free(tree_oob_pred); free(tree_oob_count);
@@ -1104,6 +1367,8 @@ rf_forest_t *rf_fit(
             .criterion = params->criterion,
             .heterogeneous = params->heterogeneous,
             .leaf_model = params->leaf_model,
+            .store_leaf_samples = params->store_leaf_samples,
+            .monotonic_cst = forest->monotonic_cst,
             .rng = &rng,
             .importance = importance,
             .depth_usage = depth_usage,
@@ -1113,14 +1378,16 @@ rf_forest_t *rf_fit(
             .idx_buf = idx_buf,
             .cls_counts_l = cls_counts_l,
             .cls_counts_r = cls_counts_r,
-            .sample_indices_buf = NULL
+            .sample_indices_buf = NULL,
+            .nan_indices = nan_indices
         };
 
-        int32_t root = build_node(&ctx, &forest->trees[t], boot_indices, n_samples, 0);
+        int32_t root = build_node(&ctx, &forest->trees[t], boot_indices, n_samples, 0,
+                                    -INFINITY, INFINITY);
         if (root < 0) {
             set_error("rf_fit: tree build failed");
             free(boot_indices); free(boot_counts); free(feature_buf);
-            free(val_buf); free(idx_buf); free(importance);
+            free(val_buf); free(idx_buf); free(nan_indices); free(importance);
             free(depth_usage); free(hrf_weights);
             free(oob_pred); free(oob_count);
             free(tree_oob_pred); free(tree_oob_count);
@@ -1272,12 +1539,92 @@ rf_forest_t *rf_fit(
         }
     }
 
+    /* Store OOB predictions for conformal prediction */
+    if (oob_pred && oob_count && params->task == 1) {
+        forest->n_train = nrow;
+        forest->oob_predictions = (double *)malloc((size_t)nrow * sizeof(double));
+        forest->oob_counts = (int32_t *)malloc((size_t)nrow * sizeof(int32_t));
+        forest->y_train_copy = (double *)malloc((size_t)nrow * sizeof(double));
+        if (forest->oob_predictions && forest->oob_counts && forest->y_train_copy) {
+            for (int32_t i = 0; i < nrow; i++) {
+                forest->oob_predictions[i] = oob_count[i] > 0
+                    ? oob_pred[i] / oob_count[i] : NAN;
+                forest->oob_counts[i] = oob_count[i];
+            }
+            memcpy(forest->y_train_copy, y, (size_t)nrow * sizeof(double));
+        }
+    }
+
+    /* Build quantile RF leaf sample storage */
+    if (params->store_leaf_samples && params->task == 1) {
+        forest->n_train = nrow;
+        forest->y_train_copy = forest->y_train_copy
+            ? forest->y_train_copy
+            : (double *)malloc((size_t)nrow * sizeof(double));
+        if (forest->y_train_copy && !forest->oob_predictions) {
+            /* Only copy if not already copied above */
+            memcpy(forest->y_train_copy, y, (size_t)nrow * sizeof(double));
+        }
+        /* For each tree, record which training samples land in each leaf */
+        for (int32_t t = 0; t < forest->n_trees; t++) {
+            rf_tree_t *tr = &forest->trees[t];
+            /* Count leaves (leaf_idx values are contiguous from leaf_data perspective,
+             * but we need the count of unique leaf nodes) */
+            int32_t max_leaf_idx = -1;
+            int32_t n_leaf_nodes = 0;
+            for (int32_t nd = 0; nd < tr->n_nodes; nd++) {
+                if (tr->nodes[nd].feature < 0) {
+                    n_leaf_nodes++;
+                    if (tr->nodes[nd].leaf_idx > max_leaf_idx)
+                        max_leaf_idx = tr->nodes[nd].leaf_idx;
+                }
+            }
+            if (n_leaf_nodes == 0) continue;
+
+            /* Build mapping: for each sample, find its leaf */
+            int32_t *counts = (int32_t *)calloc((size_t)(max_leaf_idx + 1), sizeof(int32_t));
+            int32_t *sample_leaf = (int32_t *)malloc((size_t)nrow * sizeof(int32_t));
+            if (!counts || !sample_leaf) { free(counts); free(sample_leaf); continue; }
+
+            for (int32_t i = 0; i < nrow; i++) {
+                const double *row = X + (size_t)i * ncol;
+                int32_t leaf = tree_leaf_idx(tr, row);
+                sample_leaf[i] = tr->nodes[leaf].leaf_idx;
+                counts[sample_leaf[i]]++;
+            }
+
+            /* Build CSR offsets */
+            tr->leaf_offsets = (int32_t *)malloc((size_t)(max_leaf_idx + 2) * sizeof(int32_t));
+            if (!tr->leaf_offsets) { free(counts); free(sample_leaf); continue; }
+            tr->leaf_offsets[0] = 0;
+            for (int32_t li = 0; li <= max_leaf_idx; li++) {
+                tr->leaf_offsets[li + 1] = tr->leaf_offsets[li] + counts[li];
+            }
+            tr->n_leaf_samples = tr->leaf_offsets[max_leaf_idx + 1];
+
+            tr->leaf_samples = (int32_t *)malloc((size_t)tr->n_leaf_samples * sizeof(int32_t));
+            if (!tr->leaf_samples) { free(tr->leaf_offsets); tr->leaf_offsets = NULL; free(counts); free(sample_leaf); continue; }
+
+            /* Fill CSR using counts as write cursors */
+            memset(counts, 0, (size_t)(max_leaf_idx + 1) * sizeof(int32_t));
+            for (int32_t i = 0; i < nrow; i++) {
+                int32_t li = sample_leaf[i];
+                tr->leaf_samples[tr->leaf_offsets[li] + counts[li]] = i;
+                counts[li]++;
+            }
+
+            free(counts);
+            free(sample_leaf);
+        }
+    }
+
     /* Cleanup scratch */
     free(boot_indices);
     free(boot_counts);
     free(feature_buf);
     free(val_buf);
     free(idx_buf);
+    free(nan_indices);
     free(importance);
     free(depth_usage);
     free(hrf_weights);
@@ -1402,11 +1749,191 @@ int rf_predict_proba(
     return 0;
 }
 
+/* ---------- rf_predict_quantile ---------- */
+
+static int cmp_double(const void *a, const void *b) {
+    double da = *(const double *)a, db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+int rf_predict_quantile(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    const double *quantiles, int32_t n_quantiles,
+    double *out
+) {
+    if (!forest || !X || !out || !quantiles || nrow <= 0 || n_quantiles <= 0) {
+        set_error("rf_predict_quantile: invalid input");
+        return -1;
+    }
+    if (ncol != forest->n_features) {
+        set_error("rf_predict_quantile: n_features mismatch");
+        return -1;
+    }
+    if (forest->task != 1) {
+        set_error("rf_predict_quantile: only available for regression");
+        return -1;
+    }
+    if (!forest->store_leaf_samples || !forest->y_train_copy) {
+        set_error("rf_predict_quantile: requires store_leaf_samples=1 during fit");
+        return -1;
+    }
+
+    /* For each test sample: collect all co-leaf training y-values across trees,
+     * sort, compute requested quantiles. */
+    /* Allocate buffer for collecting y-values: worst case n_train * n_trees,
+     * but typically much smaller. Use dynamic resizing. */
+    int32_t buf_cap = forest->n_train;
+    double *y_buf = (double *)malloc((size_t)buf_cap * sizeof(double));
+    if (!y_buf) { set_error("rf_predict_quantile: allocation failed"); return -1; }
+
+    for (int32_t i = 0; i < nrow; i++) {
+        const double *row = X + (size_t)i * ncol;
+        int32_t n_collected = 0;
+
+        for (int32_t t = 0; t < forest->n_trees; t++) {
+            const rf_tree_t *tr = &forest->trees[t];
+            if (!tr->leaf_samples || !tr->leaf_offsets) continue;
+
+            int32_t leaf_node = tree_leaf_idx(tr, row);
+            int32_t li = tr->nodes[leaf_node].leaf_idx;
+            int32_t start = tr->leaf_offsets[li];
+            int32_t end = tr->leaf_offsets[li + 1];
+            int32_t n_add = end - start;
+
+            /* Ensure buffer capacity */
+            if (n_collected + n_add > buf_cap) {
+                while (buf_cap < n_collected + n_add) buf_cap *= 2;
+                double *tmp = (double *)realloc(y_buf, (size_t)buf_cap * sizeof(double));
+                if (!tmp) { free(y_buf); set_error("rf_predict_quantile: allocation failed"); return -1; }
+                y_buf = tmp;
+            }
+
+            for (int32_t j = start; j < end; j++) {
+                y_buf[n_collected++] = forest->y_train_copy[tr->leaf_samples[j]];
+            }
+        }
+
+        if (n_collected == 0) {
+            for (int32_t q = 0; q < n_quantiles; q++) {
+                out[(size_t)i * n_quantiles + q] = NAN;
+            }
+            continue;
+        }
+
+        /* Sort collected y-values */
+        qsort(y_buf, (size_t)n_collected, sizeof(double), cmp_double);
+
+        /* Compute each quantile using linear interpolation */
+        for (int32_t q = 0; q < n_quantiles; q++) {
+            double p = quantiles[q];
+            if (p <= 0.0) {
+                out[(size_t)i * n_quantiles + q] = y_buf[0];
+            } else if (p >= 1.0) {
+                out[(size_t)i * n_quantiles + q] = y_buf[n_collected - 1];
+            } else {
+                double idx_f = p * (n_collected - 1);
+                int32_t lo = (int32_t)idx_f;
+                double frac = idx_f - lo;
+                if (lo >= n_collected - 1) {
+                    out[(size_t)i * n_quantiles + q] = y_buf[n_collected - 1];
+                } else {
+                    out[(size_t)i * n_quantiles + q] =
+                        y_buf[lo] * (1.0 - frac) + y_buf[lo + 1] * frac;
+                }
+            }
+        }
+    }
+
+    free(y_buf);
+    return 0;
+}
+
+/* ---------- rf_predict_interval (Jackknife+-after-Bootstrap) ---------- */
+
+int rf_predict_interval(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    double alpha,
+    double *out_lower,
+    double *out_upper
+) {
+    if (!forest || !X || !out_lower || !out_upper || nrow <= 0) {
+        set_error("rf_predict_interval: invalid input");
+        return -1;
+    }
+    if (ncol != forest->n_features) {
+        set_error("rf_predict_interval: n_features mismatch");
+        return -1;
+    }
+    if (forest->task != 1) {
+        set_error("rf_predict_interval: only available for regression");
+        return -1;
+    }
+    if (!forest->oob_predictions || !forest->oob_counts || !forest->y_train_copy) {
+        set_error("rf_predict_interval: requires bootstrap=1, compute_oob=1 during fit");
+        return -1;
+    }
+    if (alpha <= 0.0 || alpha >= 1.0) {
+        set_error("rf_predict_interval: alpha must be in (0, 1)");
+        return -1;
+    }
+
+    int32_t n_train = forest->n_train;
+
+    /* Compute OOB absolute residuals for samples that have OOB predictions */
+    int32_t n_residuals = 0;
+    double *residuals = (double *)malloc((size_t)n_train * sizeof(double));
+    if (!residuals) { set_error("rf_predict_interval: allocation failed"); return -1; }
+
+    for (int32_t i = 0; i < n_train; i++) {
+        if (forest->oob_counts[i] == 0) continue;
+        residuals[n_residuals++] = fabs(forest->y_train_copy[i] - forest->oob_predictions[i]);
+    }
+
+    if (n_residuals == 0) {
+        free(residuals);
+        set_error("rf_predict_interval: no OOB samples available");
+        return -1;
+    }
+
+    /* Sort residuals and find the (1-alpha)(1+1/n)-th quantile */
+    qsort(residuals, (size_t)n_residuals, sizeof(double), cmp_double);
+
+    double q_level = (1.0 - alpha) * (1.0 + 1.0 / n_residuals);
+    if (q_level > 1.0) q_level = 1.0;
+    int32_t q_idx = (int32_t)(q_level * n_residuals);
+    if (q_idx >= n_residuals) q_idx = n_residuals - 1;
+    double q_value = residuals[q_idx];
+
+    free(residuals);
+
+    /* Compute point predictions and add/subtract quantile */
+    double *preds = (double *)malloc((size_t)nrow * sizeof(double));
+    if (!preds) { set_error("rf_predict_interval: allocation failed"); return -1; }
+
+    if (rf_predict(forest, X, nrow, ncol, preds) != 0) {
+        free(preds);
+        return -1;
+    }
+
+    for (int32_t i = 0; i < nrow; i++) {
+        out_lower[i] = preds[i] - q_value;
+        out_upper[i] = preds[i] + q_value;
+    }
+
+    free(preds);
+    return 0;
+}
+
 /* ---------- serialization (RF01) ---------- */
 
 static const char RF01_MAGIC[4] = {'R', 'F', '0', '1'};
 #define RF01_HEADER_SIZE 56
 #define RF02_HEADER_SIZE 72
+#define RF03_HEADER_SIZE 72  /* same header size as v2; nan_dir stored per-node */
 
 int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
     if (!f || !out_buf || !out_len) {
@@ -1414,8 +1941,8 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
         return -1;
     }
 
-    /* Always write format version 2 */
-    size_t size = RF02_HEADER_SIZE;
+    /* Always write format version 3 (adds nan_dir per node) */
+    size_t size = RF03_HEADER_SIZE;
     /* tree_weights if oob_weighting */
     if (f->tree_weights) {
         size += (size_t)f->n_trees * 8;
@@ -1424,7 +1951,7 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
 
     for (int32_t t = 0; t < f->n_trees; t++) {
         size += 8;  /* tree header: n_nodes + n_leaves */
-        size += (size_t)f->trees[t].n_nodes * 28;  /* nodes */
+        size += (size_t)f->trees[t].n_nodes * 29;  /* nodes: 28 + 1 byte nan_dir */
         size += (size_t)f->trees[t].n_leaves * 8;  /* leaf data */
     }
 
@@ -1432,10 +1959,10 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
     if (!buf) { set_error("rf_save: allocation failed"); return -1; }
     char *p = buf;
 
-    /* Header (72 bytes for v2) */
+    /* Header (72 bytes, same layout as v2) */
     memcpy(p, RF01_MAGIC, 4); p += 4;
     uint32_t v;
-    v = 2; memcpy(p, &v, 4); p += 4;  /* format version 2 */
+    v = 3; memcpy(p, &v, 4); p += 4;  /* format version 3 */
     v = (uint32_t)f->n_trees; memcpy(p, &v, 4); p += 4;
     v = (uint32_t)f->n_features; memcpy(p, &v, 4); p += 4;
     v = (uint32_t)f->n_classes; memcpy(p, &v, 4); p += 4;
@@ -1487,7 +2014,7 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
         }
         v = (uint32_t)n_leaf_entries; memcpy(p, &v, 4); p += 4;
 
-        /* Nodes (28 bytes each) */
+        /* Nodes (29 bytes each: 28 + 1 byte nan_dir) */
         for (int32_t n = 0; n < tree->n_nodes; n++) {
             rf_node_t *nd = &tree->nodes[n];
             memcpy(p, &nd->feature, 4); p += 4;
@@ -1496,6 +2023,7 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
             memcpy(p, &nd->right, 4); p += 4;
             memcpy(p, &nd->n_samples, 4); p += 4;
             memcpy(p, &nd->leaf_idx, 4); p += 4;
+            *p++ = (char)nd->nan_dir;
         }
 
         /* Leaf data */
@@ -1526,13 +2054,13 @@ rf_forest_t *rf_load(const char *buf, int32_t len) {
 
     uint32_t version;
     memcpy(&version, p, 4); p += 4;
-    if (version != 1 && version != 2) {
+    if (version != 1 && version != 2 && version != 3) {
         set_error("rf_load: unsupported version");
         return NULL;
     }
 
-    if (version == 2 && len < RF02_HEADER_SIZE) {
-        set_error("rf_load: buffer too short for v2 header");
+    if (version >= 2 && len < RF02_HEADER_SIZE) {
+        set_error("rf_load: buffer too short for v2/v3 header");
         return NULL;
     }
 
@@ -1617,6 +2145,11 @@ rf_forest_t *rf_load(const char *buf, int32_t len) {
             memcpy(&nd->right, p, 4); p += 4;
             memcpy(&nd->n_samples, p, 4); p += 4;
             memcpy(&nd->leaf_idx, p, 4); p += 4;
+            if (version >= 3) {
+                nd->nan_dir = (int8_t)*p++;
+            } else {
+                nd->nan_dir = 0;
+            }
             nd->impurity = 0;  /* not stored in serialization */
         }
 
@@ -1640,6 +2173,13 @@ rf_forest_t *rf_load(const char *buf, int32_t len) {
     f->bootstrap = 1;
     f->compute_oob = 0;
     f->max_leaf_nodes = 0;
+    f->monotonic_cst = NULL;
+    f->store_leaf_samples = 0;
+    f->oob_predictions = NULL;
+    f->oob_counts = NULL;
+    f->n_train = 0;
+    f->y_train = NULL;
+    f->y_train_copy = NULL;
 
     return f;
 }
@@ -1656,6 +2196,10 @@ void rf_free(rf_forest_t *f) {
     }
     free(f->feature_importances);
     free(f->tree_weights);
+    free(f->monotonic_cst);
+    free(f->oob_predictions);
+    free(f->oob_counts);
+    free(f->y_train_copy);
     free(f);
 }
 
