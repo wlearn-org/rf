@@ -495,10 +495,10 @@ def test_v2_round_trip():
     p1 = m.predict(X)
     blob = m.save_raw()
 
-    # Version field should be 2
+    # Version field should be 3 (v0.3 with nan_dir per node)
     import struct
     ver = struct.unpack('<I', blob[4:8])[0]
-    assert ver == 2, f'expected format version 2, got {ver}'
+    assert ver == 3, f'expected format version 3, got {ver}'
 
     m2 = RFModel.load_raw(blob)
     p2 = m2.predict(X)

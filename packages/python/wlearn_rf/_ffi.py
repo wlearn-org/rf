@@ -160,6 +160,30 @@ def _load_lib():
     _lib.wl_rf_get_leaf_model.argtypes = [ctypes.c_void_p]
     _lib.wl_rf_get_leaf_model.restype = ctypes.c_int
 
+    # rf_predict_quantile
+    _lib.rf_predict_quantile.argtypes = [
+        ctypes.c_void_p,   # forest
+        ctypes.c_void_p,   # X
+        ctypes.c_int32,    # nrow
+        ctypes.c_int32,    # ncol
+        ctypes.c_void_p,   # quantiles
+        ctypes.c_int32,    # n_quantiles
+        ctypes.c_void_p,   # out
+    ]
+    _lib.rf_predict_quantile.restype = ctypes.c_int
+
+    # rf_predict_interval
+    _lib.rf_predict_interval.argtypes = [
+        ctypes.c_void_p,   # forest
+        ctypes.c_void_p,   # X
+        ctypes.c_int32,    # nrow
+        ctypes.c_int32,    # ncol
+        ctypes.c_double,   # alpha
+        ctypes.c_void_p,   # out_lower
+        ctypes.c_void_p,   # out_upper
+    ]
+    _lib.rf_predict_interval.restype = ctypes.c_int
+
     return _lib
 
 
@@ -182,7 +206,9 @@ class RFParams(ctypes.Structure):
         ('heterogeneous', ctypes.c_int32),
         ('oob_weighting', ctypes.c_int32),
         ('leaf_model', ctypes.c_int32),
-        ('_reserved', ctypes.c_int32),
+        ('store_leaf_samples', ctypes.c_int32),
         ('sample_rate', ctypes.c_double),
         ('alpha_trim', ctypes.c_double),
+        ('monotonic_cst', ctypes.POINTER(ctypes.c_int32)),
+        ('n_monotonic_cst', ctypes.c_int32),
     ]

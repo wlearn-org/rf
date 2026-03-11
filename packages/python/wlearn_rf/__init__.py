@@ -93,8 +93,26 @@ class RFModel:
         params.heterogeneous = self._params.get('heterogeneous', 0)
         params.oob_weighting = self._params.get('oob_weighting', 0)
         params.leaf_model = self._params.get('leaf_model', 0)
+        params.store_leaf_samples = self._params.get(
+            'store_leaf_samples', 1 if task == 1 else 0)
         params.sample_rate = self._params.get('sample_rate', 1.0)
         params.alpha_trim = self._params.get('alpha_trim', 0.0)
+
+        # Monotonic constraints
+        mono = self._params.get('monotonic_cst', None)
+        if mono is not None:
+            mono_arr = np.asarray(mono, dtype=np.int32)
+            if mono_arr.shape[0] == ncol:
+                self._mono_buf = mono_arr  # prevent GC
+                params.monotonic_cst = mono_arr.ctypes.data_as(
+                    ctypes.POINTER(ctypes.c_int32))
+                params.n_monotonic_cst = ncol
+            else:
+                params.monotonic_cst = None
+                params.n_monotonic_cst = 0
+        else:
+            params.monotonic_cst = None
+            params.n_monotonic_cst = 0
 
         handle = lib.rf_fit(
             X.ctypes.data, nrow, ncol,
@@ -154,6 +172,57 @@ class RFModel:
             raise RuntimeError(f'rf_predict_proba failed: {msg}')
 
         return out.reshape(nrow, nc)
+
+    def predict_quantile(self, X, quantile=0.5):
+        """Predict quantiles (quantile regression forest).
+
+        Requires store_leaf_samples=1 during fit.
+        """
+        self._ensure_fitted()
+        lib = _load_lib()
+
+        X = np.ascontiguousarray(X, dtype=np.float64)
+        if X.ndim != 2:
+            raise ValueError(f'X must be 2-dimensional, got {X.ndim}')
+        nrow, ncol = X.shape
+
+        quantiles = np.ascontiguousarray([quantile], dtype=np.float64)
+        out = np.zeros(nrow, dtype=np.float64)
+        ret = lib.rf_predict_quantile(
+            self._handle, X.ctypes.data, nrow, ncol,
+            quantiles.ctypes.data, 1, out.ctypes.data)
+        if ret != 0:
+            err = lib.rf_get_error()
+            msg = err.decode('utf-8') if err else 'unknown error'
+            raise RuntimeError(f'rf_predict_quantile failed: {msg}')
+
+        return out
+
+    def predict_interval(self, X, alpha=0.1):
+        """Predict conformal intervals (Jackknife+-after-Bootstrap).
+
+        Requires bootstrap=1, compute_oob=1 during fit.
+        Returns (lower, upper) arrays.
+        """
+        self._ensure_fitted()
+        lib = _load_lib()
+
+        X = np.ascontiguousarray(X, dtype=np.float64)
+        if X.ndim != 2:
+            raise ValueError(f'X must be 2-dimensional, got {X.ndim}')
+        nrow, ncol = X.shape
+
+        out_lower = np.zeros(nrow, dtype=np.float64)
+        out_upper = np.zeros(nrow, dtype=np.float64)
+        ret = lib.rf_predict_interval(
+            self._handle, X.ctypes.data, nrow, ncol,
+            float(alpha), out_lower.ctypes.data, out_upper.ctypes.data)
+        if ret != 0:
+            err = lib.rf_get_error()
+            msg = err.decode('utf-8') if err else 'unknown error'
+            raise RuntimeError(f'rf_predict_interval failed: {msg}')
+
+        return out_lower, out_upper
 
     def score(self, X, y):
         """Compute accuracy (classification) or R2 (regression)."""
