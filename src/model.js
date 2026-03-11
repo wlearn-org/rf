@@ -432,21 +432,25 @@ class RFModel {
     return this
   }
 
-  static defaultSearchSpace() {
-    return {
+  static defaultSearchSpace(task) {
+    const isReg = task === 'regression'
+    const space = {
       nEstimators: { type: 'int_uniform', low: 50, high: 500 },
       maxDepth: { type: 'int_uniform', low: 3, high: 30 },
       maxFeatures: { type: 'categorical', values: ['sqrt', 'log2', 'third'] },
       minSamplesSplit: { type: 'int_uniform', low: 2, high: 20 },
       minSamplesLeaf: { type: 'int_uniform', low: 1, high: 10 },
       extraTrees: { type: 'categorical', values: [0, 1] },
-      criterion: { type: 'categorical', values: ['gini', 'entropy'] },
+      criterion: isReg
+        ? { type: 'categorical', values: ['mse', 'mae'] }
+        : { type: 'categorical', values: ['gini', 'entropy', 'hellinger'] },
       sampleRate: { type: 'uniform', low: 0.5, high: 1.0 },
       heterogeneous: { type: 'categorical', values: [0, 1] },
       oobWeighting: { type: 'categorical', values: [0, 1] },
       alphaTrim: { type: 'uniform', low: 0.0, high: 0.1 },
-      leafModel: { type: 'categorical', values: [0, 1] }
     }
+    if (isReg) space.leafModel = { type: 'categorical', values: [0, 1] }
+    return space
   }
 
   // --- Inspection ---
