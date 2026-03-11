@@ -1,11 +1,40 @@
 # Changelog
 
-## [0.3.0] - 2026-03-10
+## [0.3.0] - 2026-03-11
+
+### Added
+
+- Missing value handling (NaN). At each split, both left and right NaN directions
+  are tried; the direction that maximizes gain is learned and stored per node.
+  At prediction time, NaN values follow the learned direction. Works for both
+  classification and regression.
+
+- Monotonic constraints (`monotonicCst` / `monotonic_cst`). Per-feature constraints
+  enforced via bound propagation: upper/lower prediction bounds are inherited from
+  ancestor nodes and tightened at each split. Supports both regression and binary
+  classification (P(class=1) is constrained).
+  Bartley et al. (2020) "An Improved Method for Monotone Constraints." arXiv:2011.00986.
+
+- Quantile regression forests (`predictQuantile` / `predict_quantile`). Stores
+  training sample indices per leaf in CSR format. At prediction time, aggregates
+  co-leaf samples across trees and computes weighted empirical quantiles via linear
+  interpolation. A single fitted model serves all quantiles. Auto-enabled for
+  regression tasks (`storeLeafSamples` defaults to 1 for regression).
+  Meinshausen (2006) "Quantile Regression Forests." JMLR, 7(35):983-999.
+
+- Conformal prediction intervals (`predictInterval` / `predict_interval`).
+  Jackknife+-after-Bootstrap (J+ab): computes OOB absolute residuals during fit,
+  then constructs symmetric intervals around point predictions using the
+  `(1-alpha)(1+1/n)`-th quantile of OOB residuals. Provides distribution-free
+  coverage guarantees with no additional computation beyond standard OOB scoring.
+  Barber et al. (2021) "Predictive Inference with the Jackknife+." Annals of Statistics.
 
 ### Changed
 
 - Wrap RFModel with `createModelClass` for unified task detection
 - `task` parameter (`'classification'` or `'regression'`) is now auto-detected from labels if omitted
+- Serialization format v3 (backward-compatible read of v1/v2). Adds 1 byte per
+  node for learned NaN direction (29 bytes per node, up from 28 in v2).
 
 ## [0.2.0] - 2026-03-03
 

@@ -14,9 +14,13 @@ Part of [wlearn](https://wlearn.org) ([GitHub](https://github.com/wlearn-org), [
 - MDI feature importances
 - Cost-complexity pruning
 - Local linear leaf models (regression)
+- Missing value handling (learned NaN direction per split)
+- Monotonic constraints (bound propagation)
+- Quantile regression forests (per-leaf sample storage)
+- Conformal prediction intervals (Jackknife+-after-Bootstrap)
 - Deterministic (LCG PRNG, fixed seed)
-- Binary serialization (RF01/RF02, save/load)
-- 85 C tests, 39 JS tests, 27 Python tests
+- Binary serialization (RF01/RF02/RF03, save/load)
+- 85 C tests, 39 JS tests, 27 Python tests, 74 parity tests
 
 Default parameters match sklearn's `RandomForestClassifier` / `RandomForestRegressor` exactly.
 
@@ -67,6 +71,13 @@ const reg = await RFModel.create({
 })
 reg.fit(X_train, y_train)
 const r2 = reg.score(X_test, y_test)
+
+// Quantile predictions
+const median = reg.predictQuantile(X_test, 0.5)
+const [q10, q90] = reg.predictQuantile(X_test, [0.1, 0.9])
+
+// Prediction intervals (90% coverage)
+const { lower, upper } = reg.predictInterval(X_test, 0.1)
 reg.dispose()
 ```
 
@@ -87,6 +98,12 @@ clf.dispose()
 reg = RFModel({'n_estimators': 100, 'task': 'regression', 'seed': 42})
 reg.fit(X_train, y_train)
 r2 = reg.score(X_test, y_test)
+
+# Quantile predictions
+median = reg.predict_quantile(X_test, quantile=0.5)
+
+# Prediction intervals (90% coverage)
+lower, upper = reg.predict_interval(X_test, alpha=0.1)
 reg.dispose()
 ```
 
@@ -106,7 +123,20 @@ rf_forest_t *forest = rf_fit(X, nrow, ncol, y, &params);
 double *preds = malloc(nrow * sizeof(double));
 rf_predict(forest, X, nrow, ncol, preds);
 
+// Quantile predictions (requires store_leaf_samples=1)
+params.store_leaf_samples = 1;
+rf_forest_t *qrf = rf_fit(X, nrow, ncol, y, &params);
+double quantiles[] = {0.1, 0.5, 0.9};
+double *qout = malloc(nrow * 3 * sizeof(double));
+rf_predict_quantile(qrf, X_test, ntest, ncol, quantiles, 3, qout);
+
+// Conformal prediction intervals (requires bootstrap + OOB)
+double *lower = malloc(ntest * sizeof(double));
+double *upper = malloc(ntest * sizeof(double));
+rf_predict_interval(forest, X_test, ntest, ncol, 0.1, lower, upper);
+
 rf_free(forest);
+rf_free(qrf);
 ```
 
 ## API Reference
@@ -129,7 +159,7 @@ All parameters have defaults that match sklearn. New features are opt-in and do 
 | Seed | `seed` | `seed` | `seed` | 42 | Random seed for reproducibility |
 | Task | `task` | `task` | `task` | `'classification'` / 0 | `'classification'` or `'regression'` (JS); 0 or 1 (C/Python) |
 
-### New Parameters (v0.2)
+### v0.2 Parameters
 
 | Parameter | JS name | Python name | C field | Default | Description |
 |-----------|---------|-------------|---------|---------|-------------|
@@ -139,6 +169,13 @@ All parameters have defaults that match sklearn. New features are opt-in and do 
 | OOB weighting | `oobWeighting` | `oob_weighting` | `oob_weighting` | 0 | Weight tree votes by OOB performance. 1 = enabled |
 | Alpha trim | `alphaTrim` | `alpha_trim` | `alpha_trim` | 0.0 | Cost-complexity pruning penalty. 0 = no pruning |
 | Leaf model | `leafModel` | `leaf_model` | `leaf_model` | 0 | Leaf prediction model. 0 = constant (mean), 1 = local linear (regression only) |
+
+### v0.3 Parameters
+
+| Parameter | JS name | Python name | C field | Default | Description |
+|-----------|---------|-------------|---------|---------|-------------|
+| Store leaf samples | `storeLeafSamples` | `store_leaf_samples` | `store_leaf_samples` | auto | Store per-leaf sample indices for quantile prediction. Auto-enabled for regression |
+| Monotonic constraints | `monotonicCst` | `monotonic_cst` | `monotonic_cst` | null | Per-feature constraints: -1 = decreasing, 0 = none, +1 = increasing. Array of length n_features |
 
 ### Methods
 
@@ -155,6 +192,13 @@ model.fit(X, y)                // X: number[][] or Float64Array, y: number[]
 model.predict(X)               // Returns Float64Array
 model.predictProba(X)          // Classification only. Returns Float64Array (flat, row-major)
 model.score(X, y)              // Accuracy (cls) or R2 (reg)
+
+// Quantile prediction (regression, requires store_leaf_samples)
+model.predictQuantile(X, 0.5)           // Single quantile: returns Float64Array
+model.predictQuantile(X, [0.1, 0.9])   // Multiple: returns [Float64Array, Float64Array]
+
+// Conformal prediction intervals (regression, requires bootstrap + OOB)
+model.predictInterval(X, alpha)  // Returns { lower: Float64Array, upper: Float64Array }
 
 // Inspection
 model.featureImportances()     // Returns Float64Array (normalized MDI)
@@ -194,6 +238,12 @@ model.predict(X)               # Returns numpy array
 model.predict_proba(X)         # Classification only. Returns (n, n_classes) array
 model.score(X, y)              # Accuracy (cls) or R2 (reg)
 
+# Quantile prediction (regression)
+model.predict_quantile(X, quantile=0.5)    # Returns numpy array
+
+# Conformal prediction intervals (regression)
+lower, upper = model.predict_interval(X, alpha=0.1)  # Returns (lower, upper) arrays
+
 # Inspection
 model.feature_importances()    # Returns numpy array
 model.oob_score()              # OOB score
@@ -203,7 +253,7 @@ model.n_trees                  # Number of trees
 model.is_fitted                # Whether model is fitted
 
 # Persistence
-blob = model.save_raw()        # Returns bytes (RF01/RF02 binary)
+blob = model.save_raw()        # Returns bytes (RF01/RF02/RF03 binary)
 loaded = RFModel.load_raw(blob, params={'task': 'regression'})
 
 # Cleanup
@@ -228,6 +278,19 @@ int rf_predict(const rf_forest_t *forest, const double *X,
 int rf_predict_proba(const rf_forest_t *forest, const double *X,
                      int32_t nrow, int32_t ncol, double *out);
 
+// Predict quantiles (requires store_leaf_samples=1).
+// out: nrow * n_quantiles doubles, row-major.
+int rf_predict_quantile(const rf_forest_t *forest, const double *X,
+                        int32_t nrow, int32_t ncol,
+                        const double *quantiles, int32_t n_quantiles,
+                        double *out);
+
+// Predict conformal intervals (requires bootstrap + OOB).
+// out_lower, out_upper: nrow doubles each.
+int rf_predict_interval(const rf_forest_t *forest, const double *X,
+                        int32_t nrow, int32_t ncol, double alpha,
+                        double *out_lower, double *out_upper);
+
 // Serialize / deserialize
 int rf_save(const rf_forest_t *forest, char **out_buf, int32_t *out_len);
 rf_forest_t *rf_load(const char *buf, int32_t len);
@@ -241,6 +304,93 @@ const char *rf_get_error(void);
 ```
 
 ## Advanced Usage Examples
+
+### Missing values (NaN)
+
+NaN values are handled automatically. At each split, both NaN directions (left/right) are tried and the best is learned. At prediction time, NaN values follow the learned direction.
+
+```js
+// JS: NaN values work transparently
+const X = [[1.0, NaN], [2.0, 3.0], [NaN, 4.0]]
+const y = [0, 1, 0]
+model.fit(X, y)
+model.predict([[NaN, 2.0]])  // NaN follows learned direction
+```
+
+```python
+# Python: NaN values work transparently
+X = np.array([[1.0, np.nan], [2.0, 3.0], [np.nan, 4.0]])
+y = np.array([0, 1, 0])
+model.fit(X, y)
+model.predict(np.array([[np.nan, 2.0]]))
+```
+
+### Monotonic constraints
+
+Enforce monotonic relationships between features and predictions. Useful when domain knowledge dictates that increasing a feature should never decrease the prediction.
+
+```js
+const model = await RFModel.create({
+  task: 'regression',
+  monotonicCst: [1, -1, 0],  // feature 0: increasing, 1: decreasing, 2: unconstrained
+  seed: 42
+})
+model.fit(X, y)
+```
+
+```python
+model = RFModel({
+    'task': 'regression',
+    'monotonic_cst': [1, -1, 0],
+    'seed': 42
+})
+model.fit(X, y)
+```
+
+### Quantile regression forests
+
+Predict any quantile of the conditional distribution. A single fitted model serves all quantiles.
+
+```js
+const model = await RFModel.create({
+  task: 'regression', nEstimators: 200, seed: 42
+})
+model.fit(X_train, y_train)
+
+// 90% prediction interval via quantiles
+const [q05, q95] = model.predictQuantile(X_test, [0.05, 0.95])
+model.dispose()
+```
+
+```python
+model = RFModel({'task': 'regression', 'n_estimators': 200, 'seed': 42})
+model.fit(X_train, y_train)
+
+q05 = model.predict_quantile(X_test, quantile=0.05)
+q95 = model.predict_quantile(X_test, quantile=0.95)
+```
+
+### Conformal prediction intervals
+
+Distribution-free prediction intervals with finite-sample coverage guarantees via Jackknife+-after-Bootstrap. Uses OOB residuals computed during training.
+
+```js
+const model = await RFModel.create({
+  task: 'regression', nEstimators: 200, seed: 42
+})
+model.fit(X_train, y_train)
+
+// 90% prediction intervals (alpha=0.1)
+const { lower, upper } = model.predictInterval(X_test, 0.1)
+model.dispose()
+```
+
+```python
+model = RFModel({'task': 'regression', 'n_estimators': 200, 'seed': 42})
+model.fit(X_train, y_train)
+
+lower, upper = model.predict_interval(X_test, alpha=0.1)
+```
 
 ### Entropy criterion with sample rate
 
@@ -342,6 +492,7 @@ const model = await RFModel.create({
   heterogeneous: 1,       // depth-dependent feature weighting
   oobWeighting: 1,        // weight trees by OOB performance
   sampleRate: 0.8,        // subsample 80%
+  monotonicCst: [1, 0, -1, 0, 0],  // monotonic constraints
   seed: 42
 })
 model.fit(X, y)
@@ -390,8 +541,9 @@ trends that constant leaves miss. The fit time is also lower due to fewer nodes.
 
 ## Serialization
 
-Models are serialized in a compact binary format (RF01 magic, format version 2).
-The format is backward-compatible: v2 readers can load v1 files (new fields get defaults).
+Models are serialized in a compact binary format (RF01 magic, format version 3).
+The format is backward-compatible: v3 readers can load v1/v2 files (new fields get defaults).
+v3 adds 1 byte per node for learned NaN direction.
 
 ```js
 // JS: wlearn bundle format (wraps RF binary in WLRN container)
@@ -430,7 +582,7 @@ Requires Emscripten.
 
 ```bash
 bash scripts/build-wasm.sh        # outputs wasm/rf.js
-bash scripts/verify-exports.sh    # verifies 20 exports
+bash scripts/verify-exports.sh    # verifies 22 exports
 ```
 
 ### JS Tests
@@ -442,7 +594,8 @@ node test/test.js                 # 39 tests
 ### Python Tests
 
 ```bash
-RF_LIB_PATH=build/librf.so python test/test_python.py  # 27 tests
+RF_LIB_PATH=build/librf.so python test/test_python.py       # 27 tests
+RF_LIB_PATH=build/librf.so python -m pytest test/test_parity.py -v  # 74 tests
 ```
 
 ### Benchmark
@@ -454,6 +607,11 @@ gcc -O2 -std=c11 -o build/benchmark test/benchmark.c csrc/rf.c -Icsrc -lm
 
 ## References
 
+- Meinshausen (2006). "Quantile Regression Forests." JMLR, 7(35):983-999.
+- Barber et al. (2021). "Predictive Inference with the Jackknife+." Annals of
+  Statistics, 49(1):486-507.
+- Bartley et al. (2020). "An Improved Method for Monotone Constraints in Gradient
+  Boosting." arXiv:2011.00986.
 - Cieslak et al. (2012). "Hellinger distance decision trees are robust and
   skew-insensitive." Data Mining and Knowledge Discovery, 24(1), 136-158.
 - Klusowski & Tian (2024). "Heterogeneous Random Forests." arXiv:2410.19022.
