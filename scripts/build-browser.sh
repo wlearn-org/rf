@@ -21,23 +21,23 @@ NAME=$(node -e "
 # Auto-infer export names from the final module.exports object in src/index.js
 # Do not require() the module here: prepack must work from a clean checkout
 # without needing runtime deps like @wlearn/core to be installed.
-EXPORTS=$(node -e "
-  const fs = require('fs')
-  const path = require('path')
-  const src = fs.readFileSync(path.join('${PROJECT_DIR}', 'src', 'index.js'), 'utf8')
+EXPORTS=$(node -e '
+  const fs = require("fs")
+  const path = require("path")
+  const src = fs.readFileSync(path.join("'"${PROJECT_DIR}"'", "src", "index.js"), "utf8")
   const noComments = src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1')
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1")
   const match = noComments.match(/module\.exports\s*=\s*\{([\s\S]*?)\}/m)
-  if (!match) throw new Error('Could not find module.exports object in src/index.js')
+  if (!match) throw new Error("Could not find module.exports object in src/index.js")
   const exportsText = match[1]
   const names = exportsText
-    .split(',')
+    .split(",")
     .map(s => s.trim())
     .filter(Boolean)
-    .map(s => s.split(':')[0].trim())
-  console.log(names.join(','))
-")
+    .map(s => s.split(":")[0].trim())
+  console.log(names.join(","))
+')
 
 echo "=== Building browser bundles ==="
 echo "  Package: ${NAME}"
