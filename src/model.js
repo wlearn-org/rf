@@ -123,6 +123,21 @@ class RFModel {
     const yPtr = wasm._malloc(yData.length * 8)
     wasm.HEAPF64.set(yData, yPtr / 8)
 
+    // Monotonic constraints (int32 array on WASM heap)
+    let monoPtr = 0
+    let nMono = 0
+    const monoCst = this.#params.monotonicCst
+    if (monoCst && Array.isArray(monoCst) && monoCst.length === cols) {
+      nMono = cols
+      monoPtr = wasm._malloc(cols * 4)
+      for (let i = 0; i < cols; i++) {
+        wasm.HEAP32[(monoPtr >> 2) + i] = monoCst[i] | 0
+      }
+    }
+
+    // Default store_leaf_samples=1 for regression (enables quantile prediction)
+    const storeLeafSamples = this.#params.storeLeafSamples ?? (task === 1 ? 1 : 0)
+
     const modelPtr = wasm._wl_rf_fit(
       xPtr, rows, cols,
       yPtr,
@@ -142,11 +157,15 @@ class RFModel {
       this.#params.heterogeneous ?? 0,
       this.#params.oobWeighting ?? 0,
       this.#params.alphaTrim ?? 0.0,
-      this.#params.leafModel ?? 0
+      this.#params.leafModel ?? 0,
+      storeLeafSamples,
+      monoPtr,
+      nMono
     )
 
     wasm._free(xPtr)
     wasm._free(yPtr)
+    if (monoPtr) wasm._free(monoPtr)
 
     if (!modelPtr) {
       throw new Error(`Training failed: ${getLastError()}`)
@@ -238,6 +257,79 @@ class RFModel {
       }
       return correct / preds.length
     }
+  }
+
+  predictQuantile(X, quantiles) {
+    this.#ensureFitted()
+    const wasm = getWasm()
+    const { data: xData, rows, cols } = this.#normalizeX(X)
+
+    const qArr = Array.isArray(quantiles) ? quantiles : [quantiles]
+    const nQ = qArr.length
+
+    const xPtr = wasm._malloc(xData.length * 8)
+    wasm.HEAPF64.set(xData, xPtr / 8)
+
+    const qPtr = wasm._malloc(nQ * 8)
+    for (let i = 0; i < nQ; i++) wasm.HEAPF64[(qPtr / 8) + i] = qArr[i]
+
+    const outPtr = wasm._malloc(rows * nQ * 8)
+
+    const ret = wasm._wl_rf_predict_quantile(this.#handle, xPtr, rows, cols, qPtr, nQ, outPtr)
+
+    wasm._free(xPtr)
+    wasm._free(qPtr)
+
+    if (ret !== 0) {
+      wasm._free(outPtr)
+      throw new Error(`predictQuantile failed: ${getLastError()}`)
+    }
+
+    const result = new Float64Array(rows * nQ)
+    result.set(wasm.HEAPF64.subarray(outPtr / 8, outPtr / 8 + rows * nQ))
+    wasm._free(outPtr)
+
+    // Single quantile: return flat array
+    if (nQ === 1) return result
+
+    // Multiple quantiles: return array of arrays
+    const out = []
+    for (let q = 0; q < nQ; q++) {
+      const col = new Float64Array(rows)
+      for (let i = 0; i < rows; i++) col[i] = result[i * nQ + q]
+      out.push(col)
+    }
+    return out
+  }
+
+  predictInterval(X, alpha = 0.1) {
+    this.#ensureFitted()
+    const wasm = getWasm()
+    const { data: xData, rows, cols } = this.#normalizeX(X)
+
+    const xPtr = wasm._malloc(xData.length * 8)
+    wasm.HEAPF64.set(xData, xPtr / 8)
+
+    const lowerPtr = wasm._malloc(rows * 8)
+    const upperPtr = wasm._malloc(rows * 8)
+
+    const ret = wasm._wl_rf_predict_interval(this.#handle, xPtr, rows, cols, alpha, lowerPtr, upperPtr)
+
+    wasm._free(xPtr)
+
+    if (ret !== 0) {
+      wasm._free(lowerPtr)
+      wasm._free(upperPtr)
+      throw new Error(`predictInterval failed: ${getLastError()}`)
+    }
+
+    const lower = new Float64Array(rows)
+    const upper = new Float64Array(rows)
+    lower.set(wasm.HEAPF64.subarray(lowerPtr / 8, lowerPtr / 8 + rows))
+    upper.set(wasm.HEAPF64.subarray(upperPtr / 8, upperPtr / 8 + rows))
+    wasm._free(lowerPtr)
+    wasm._free(upperPtr)
+    return { lower, upper }
   }
 
   // --- Feature importances ---

@@ -33,6 +33,8 @@ EXPECTED_EXPORTS=(
   wl_rf_get_oob_weighting
   wl_rf_get_alpha_trim
   wl_rf_get_leaf_model
+  wl_rf_predict_quantile
+  wl_rf_predict_interval
 )
 
 missing=0

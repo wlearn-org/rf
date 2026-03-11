@@ -39,6 +39,8 @@ EXPORTED_FUNCTIONS='[
   "_wl_rf_get_oob_weighting",
   "_wl_rf_get_alpha_trim",
   "_wl_rf_get_leaf_model",
+  "_wl_rf_predict_quantile",
+  "_wl_rf_predict_interval",
   "_malloc",
   "_free"
 ]'
