@@ -98,6 +98,37 @@ class RFModel:
         params.sample_rate = self._params.get('sample_rate', 1.0)
         params.alpha_trim = self._params.get('alpha_trim', 0.0)
 
+        # Sample weights (class_weight='balanced' auto-computes)
+        sw = self._params.get('sample_weight', None)
+        class_weight = self._params.get('class_weight', None)
+        if sw is None and class_weight == 'balanced' and task == 0:
+            classes, counts = np.unique(y, return_counts=True)
+            n_cls = len(classes)
+            weight_map = {int(c): nrow / (n_cls * cnt) for c, cnt in zip(classes, counts)}
+            sw = np.array([weight_map[int(yi)] for yi in y], dtype=np.float64)
+
+        if sw is not None:
+            sw_arr = np.ascontiguousarray(sw, dtype=np.float64)
+            if sw_arr.shape[0] != nrow:
+                raise ValueError(
+                    f'sample_weight length ({sw_arr.shape[0]}) does not match X rows ({nrow})')
+            self._sw_buf = sw_arr  # prevent GC
+            params.sample_weight = sw_arr.ctypes.data_as(
+                ctypes.POINTER(ctypes.c_double))
+            params.n_sample_weight = nrow
+        else:
+            params.sample_weight = None
+            params.n_sample_weight = 0
+
+        # Histogram binning
+        params.histogram = self._params.get('histogram_binning', 0)
+        params.max_bins = self._params.get('max_bins', 256)
+
+        # JARF rotation
+        params.jarf = self._params.get('jarf', 0)
+        params.jarf_n_estimators = self._params.get('jarf_n_estimators', 50)
+        params.jarf_max_depth = self._params.get('jarf_max_depth', 6)
+
         # Monotonic constraints
         mono = self._params.get('monotonic_cst', None)
         if mono is not None:
@@ -244,6 +275,57 @@ class RFModel:
         for i in range(self._n_features):
             result[i] = lib.wl_rf_get_feature_importance(self._handle, i)
         return result
+
+    def permutation_importance(self, X, y, n_repeats=5, seed=42):
+        """Compute permutation feature importance (unbiased).
+
+        For each feature, shuffles it n_repeats times, re-predicts, measures
+        score drop (accuracy for classification, R2 for regression).
+        """
+        self._ensure_fitted()
+        lib = _load_lib()
+
+        X = np.ascontiguousarray(X, dtype=np.float64)
+        y = np.ascontiguousarray(y, dtype=np.float64)
+        if X.ndim != 2:
+            raise ValueError(f'X must be 2-dimensional, got {X.ndim}')
+        nrow, ncol = X.shape
+        if y.shape[0] != nrow:
+            raise ValueError(f'y length ({y.shape[0]}) does not match X rows ({nrow})')
+
+        out = np.zeros(ncol, dtype=np.float64)
+        ret = lib.rf_permutation_importance(
+            self._handle, X.ctypes.data, nrow, ncol,
+            y.ctypes.data, n_repeats, seed, out.ctypes.data)
+        if ret != 0:
+            err = lib.rf_get_error()
+            msg = err.decode('utf-8') if err else 'unknown error'
+            raise RuntimeError(f'rf_permutation_importance failed: {msg}')
+
+        return out
+
+    def proximity(self, X):
+        """Compute proximity matrix.
+
+        Returns nrow x nrow matrix where entry (i,j) is the fraction
+        of trees where samples i and j land in the same leaf.
+        """
+        self._ensure_fitted()
+        lib = _load_lib()
+
+        X = np.ascontiguousarray(X, dtype=np.float64)
+        if X.ndim != 2:
+            raise ValueError(f'X must be 2-dimensional, got {X.ndim}')
+        nrow, ncol = X.shape
+
+        out = np.zeros(nrow * nrow, dtype=np.float64)
+        ret = lib.rf_proximity(self._handle, X.ctypes.data, nrow, ncol, out.ctypes.data)
+        if ret != 0:
+            err = lib.rf_get_error()
+            msg = err.decode('utf-8') if err else 'unknown error'
+            raise RuntimeError(f'rf_proximity failed: {msg}')
+
+        return out.reshape(nrow, nrow)
 
     def oob_score(self):
         """Return OOB accuracy (classification) or R2 (regression)."""

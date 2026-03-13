@@ -680,9 +680,8 @@ def _has_histogram_binning():
         X = rng.randn(10, 2)
         y = (X[:, 0] > 0).astype(float)
         m.fit(X, y)
-        # Check if the model actually used binning (needs a getter or flag)
         m.dispose()
-        return False  # Will return True once implemented and detectable
+        return True
     except Exception:
         return False
 
@@ -701,7 +700,7 @@ def _has_monotonic_constraints():
 
 def _has_jarf():
     """Check if JARF rotation is supported."""
-    return False  # Will return True once implemented
+    return True
 
 
 @pytest.mark.skipif(not _has_predict_quantile(),

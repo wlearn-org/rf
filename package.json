@@ -1,7 +1,7 @@
 {
   "name": "@wlearn/rf",
-  "version": "0.1.0",
-  "description": "Random Forest from scratch in C11, compiled to WebAssembly -- classification, regression, ExtraTrees, OOB scoring, MDI feature importances",
+  "version": "0.4.0",
+  "description": "Random Forest from scratch in C11, compiled to WebAssembly -- classification, regression, ExtraTrees, quantile RF, conformal prediction, histogram binning, JARF rotation, sample weights, proximity matrix",
   "type": "commonjs",
   "main": "src/index.js",
   "exports": {
@@ -40,6 +40,9 @@
     "extra-trees",
     "classification",
     "regression",
+    "quantile-regression",
+    "conformal-prediction",
+    "histogram-binning",
     "machine-learning",
     "wasm",
     "webassembly",

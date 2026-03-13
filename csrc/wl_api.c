@@ -33,7 +33,14 @@ rf_forest_t *wl_rf_fit(
     int leaf_model,
     int store_leaf_samples,
     const int32_t *monotonic_cst,
-    int n_monotonic_cst
+    int n_monotonic_cst,
+    const double *sample_weight,
+    int n_sample_weight,
+    int histogram,
+    int max_bins,
+    int jarf,
+    int jarf_n_estimators,
+    int jarf_max_depth
 ) {
     rf_params_t params;
     rf_params_init(&params);
@@ -57,6 +64,13 @@ rf_forest_t *wl_rf_fit(
     params.store_leaf_samples = store_leaf_samples;
     params.monotonic_cst = (int32_t *)monotonic_cst;
     params.n_monotonic_cst = n_monotonic_cst;
+    params.sample_weight = (double *)sample_weight;
+    params.n_sample_weight = n_sample_weight;
+    params.histogram = histogram;
+    params.max_bins = max_bins;
+    params.jarf = jarf;
+    params.jarf_n_estimators = jarf_n_estimators;
+    params.jarf_max_depth = jarf_max_depth;
     return rf_fit(X, (int32_t)nrow, (int32_t)ncol, y, &params);
 }
 
@@ -146,4 +160,14 @@ int wl_rf_predict_interval(const rf_forest_t *f, const double *X, int nrow, int 
                            double alpha, double *out_lower, double *out_upper) {
     return rf_predict_interval(f, X, (int32_t)nrow, (int32_t)ncol,
                                alpha, out_lower, out_upper);
+}
+
+int wl_rf_permutation_importance(const rf_forest_t *f, const double *X, int nrow, int ncol,
+                                  const double *y, int n_repeats, int seed, double *out) {
+    return rf_permutation_importance(f, X, (int32_t)nrow, (int32_t)ncol,
+                                      y, (int32_t)n_repeats, (uint32_t)seed, out);
+}
+
+int wl_rf_proximity(const rf_forest_t *f, const double *X, int nrow, int ncol, double *out) {
+    return rf_proximity(f, X, (int32_t)nrow, (int32_t)ncol, out);
 }

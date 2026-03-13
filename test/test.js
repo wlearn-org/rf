@@ -800,6 +800,129 @@ await test('Same seed produces identical models across create() calls', async ()
 })
 
 // ============================================================
+// Sample weight tests
+// ============================================================
+
+await test('sample weight -- weighted classification', async () => {
+  const rng = makeLCG(900)
+  const X = [], y = []
+  // 90 class-0, 10 class-1
+  for (let i = 0; i < 90; i++) {
+    X.push([rng() * 2, rng() * 2])
+    y.push(0)
+  }
+  for (let i = 0; i < 10; i++) {
+    X.push([3 + rng() * 2, 3 + rng() * 2])
+    y.push(1)
+  }
+
+  // Without weights: should work fine
+  const m1 = await RFModel.create({ task: 'classification', nEstimators: 50, seed: 42 })
+  m1.fit(X, y)
+  const acc1 = m1.score(X, y)
+  assert(acc1 > 0.9, `unweighted acc ${acc1} should be > 0.9`)
+
+  // With 4x weight on minority class
+  const sw = new Float64Array(100)
+  for (let i = 0; i < 90; i++) sw[i] = 1.0
+  for (let i = 90; i < 100; i++) sw[i] = 4.0
+
+  const m2 = await RFModel.create({
+    task: 'classification', nEstimators: 50, seed: 42, sampleWeight: sw
+  })
+  m2.fit(X, y)
+  const acc2 = m2.score(X, y)
+  assert(acc2 > 0.9, `weighted acc ${acc2} should be > 0.9`)
+
+  m1.dispose()
+  m2.dispose()
+})
+
+await test('sample weight -- classWeight balanced', async () => {
+  const rng = makeLCG(901)
+  const X = [], y = []
+  for (let i = 0; i < 90; i++) {
+    X.push([rng() * 2, rng() * 2])
+    y.push(0)
+  }
+  for (let i = 0; i < 10; i++) {
+    X.push([3 + rng() * 2, 3 + rng() * 2])
+    y.push(1)
+  }
+
+  const m = await RFModel.create({
+    task: 'classification', nEstimators: 50, seed: 42, classWeight: 'balanced'
+  })
+  m.fit(X, y)
+  const acc = m.score(X, y)
+  assert(acc > 0.9, `balanced acc ${acc} should be > 0.9`)
+  m.dispose()
+})
+
+await test('sample weight -- uniform weights match no weights', async () => {
+  const rng = makeLCG(902)
+  const { X, y } = makeRegressionData(rng, 60, 3)
+
+  const m1 = await RFModel.create({ task: 'regression', nEstimators: 20, seed: 77 })
+  m1.fit(X, y)
+  const p1 = m1.predict(X)
+
+  const sw = new Float64Array(60).fill(1.0)
+  const m2 = await RFModel.create({
+    task: 'regression', nEstimators: 20, seed: 77, sampleWeight: sw
+  })
+  m2.fit(X, y)
+  const p2 = m2.predict(X)
+
+  for (let i = 0; i < p1.length; i++) {
+    assertClose(p1[i], p2[i], 1e-10, `pred mismatch at ${i}`)
+  }
+  m1.dispose()
+  m2.dispose()
+})
+
+await test('sample weight -- zero weight garbage ignored', async () => {
+  const rng = makeLCG(903)
+  const X = [], y = []
+  // 50 clean samples: y = 2*x[0] + x[1]
+  for (let i = 0; i < 50; i++) {
+    const x0 = rng() * 4, x1 = rng() * 4
+    X.push([x0, x1])
+    y.push(2 * x0 + x1)
+  }
+  // 50 garbage with zero weight
+  for (let i = 0; i < 50; i++) {
+    X.push([rng() * 4, rng() * 4])
+    y.push(999.0)
+  }
+
+  const sw = new Float64Array(100)
+  for (let i = 0; i < 50; i++) sw[i] = 1.0
+  // sw[50..99] = 0.0
+
+  const m = await RFModel.create({
+    task: 'regression', nEstimators: 50, seed: 42, sampleWeight: sw
+  })
+  m.fit(X, y)
+
+  // Predict on clean samples
+  const Xtest = X.slice(0, 50)
+  const ytest = y.slice(0, 50)
+  const preds = m.predict(Xtest)
+
+  let ssRes = 0, ssTot = 0, yMean = 0
+  for (let i = 0; i < 50; i++) yMean += ytest[i]
+  yMean /= 50
+  for (let i = 0; i < 50; i++) {
+    ssRes += (ytest[i] - preds[i]) ** 2
+    ssTot += (ytest[i] - yMean) ** 2
+  }
+  const r2 = 1 - ssRes / ssTot
+  assert(r2 > 0.8, `zero-weight r2 ${r2} should be > 0.8 (garbage ignored)`)
+  m.dispose()
+})
+
+// ============================================================
 // Summary
 // ============================================================
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`)

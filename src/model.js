@@ -138,6 +138,37 @@ class RFModel {
     // Default store_leaf_samples=1 for regression (enables quantile prediction)
     const storeLeafSamples = this.#params.storeLeafSamples ?? (task === 1 ? 1 : 0)
 
+    // Sample weights (classWeight: 'balanced' auto-computes)
+    let swPtr = 0
+    let nSw = 0
+    let sampleWeight = this.#params.sampleWeight
+    if (!sampleWeight && this.#params.classWeight === 'balanced' && task === 0) {
+      // Compute balanced weights: n / (K * n_k)
+      const counts = {}
+      for (let i = 0; i < yData.length; i++) {
+        const c = yData[i]
+        counts[c] = (counts[c] || 0) + 1
+      }
+      const nClasses = Object.keys(counts).length
+      sampleWeight = new Float64Array(rows)
+      for (let i = 0; i < yData.length; i++) {
+        sampleWeight[i] = rows / (nClasses * counts[yData[i]])
+      }
+    }
+    if (sampleWeight) {
+      const sw = sampleWeight instanceof Float64Array
+        ? sampleWeight : new Float64Array(sampleWeight)
+      if (sw.length !== rows) {
+        wasm._free(xPtr)
+        wasm._free(yPtr)
+        if (monoPtr) wasm._free(monoPtr)
+        throw new Error(`sampleWeight length (${sw.length}) does not match X rows (${rows})`)
+      }
+      nSw = rows
+      swPtr = wasm._malloc(rows * 8)
+      wasm.HEAPF64.set(sw, swPtr / 8)
+    }
+
     const modelPtr = wasm._wl_rf_fit(
       xPtr, rows, cols,
       yPtr,
@@ -160,12 +191,20 @@ class RFModel {
       this.#params.leafModel ?? 0,
       storeLeafSamples,
       monoPtr,
-      nMono
+      nMono,
+      swPtr,
+      nSw,
+      this.#params.histogramBinning ?? 0,
+      this.#params.maxBins ?? 256,
+      this.#params.jarf ?? 0,
+      this.#params.jarfNEstimators ?? 50,
+      this.#params.jarfMaxDepth ?? 6
     )
 
     wasm._free(xPtr)
     wasm._free(yPtr)
     if (monoPtr) wasm._free(monoPtr)
+    if (swPtr) wasm._free(swPtr)
 
     if (!modelPtr) {
       throw new Error(`Training failed: ${getLastError()}`)
@@ -345,6 +384,61 @@ class RFModel {
     return result
   }
 
+  permutationImportance(X, y, { nRepeats = 5, seed = 42 } = {}) {
+    this.#ensureFitted()
+    const wasm = getWasm()
+    const { data: xData, rows, cols } = this.#normalizeX(X)
+
+    const yArr = Float64Array.from(y)
+    if (yArr.length !== rows) throw new Error(`y length (${yArr.length}) != X rows (${rows})`)
+
+    const xPtr = wasm._malloc(xData.length * 8)
+    const yPtr = wasm._malloc(yArr.length * 8)
+    const outPtr = wasm._malloc(cols * 8)
+    wasm.HEAPF64.set(xData, xPtr / 8)
+    wasm.HEAPF64.set(yArr, yPtr / 8)
+
+    const ret = wasm._wl_rf_permutation_importance(this.#handle, xPtr, rows, cols, yPtr, nRepeats, seed, outPtr)
+
+    wasm._free(xPtr)
+    wasm._free(yPtr)
+
+    if (ret !== 0) {
+      wasm._free(outPtr)
+      throw new Error(`permutationImportance failed: ${getLastError()}`)
+    }
+
+    const result = new Float64Array(cols)
+    result.set(wasm.HEAPF64.subarray(outPtr / 8, outPtr / 8 + cols))
+    wasm._free(outPtr)
+    return result
+  }
+
+  proximity(X) {
+    this.#ensureFitted()
+    const wasm = getWasm()
+    const { data: xData, rows, cols } = this.#normalizeX(X)
+
+    const xPtr = wasm._malloc(xData.length * 8)
+    wasm.HEAPF64.set(xData, xPtr / 8)
+
+    const outPtr = wasm._malloc(rows * rows * 8)
+
+    const ret = wasm._wl_rf_proximity(this.#handle, xPtr, rows, cols, outPtr)
+
+    wasm._free(xPtr)
+
+    if (ret !== 0) {
+      wasm._free(outPtr)
+      throw new Error(`proximity failed: ${getLastError()}`)
+    }
+
+    const result = new Float64Array(rows * rows)
+    result.set(wasm.HEAPF64.subarray(outPtr / 8, outPtr / 8 + rows * rows))
+    wasm._free(outPtr)
+    return result
+  }
+
   oobScore() {
     this.#ensureFitted()
     const wasm = getWasm()
@@ -448,6 +542,8 @@ class RFModel {
       heterogeneous: { type: 'categorical', values: [0, 1] },
       oobWeighting: { type: 'categorical', values: [0, 1] },
       alphaTrim: { type: 'uniform', low: 0.0, high: 0.1 },
+      histogramBinning: { type: 'categorical', values: [0, 1] },
+      jarf: { type: 'categorical', values: [0, 1] },
     }
     if (isReg) space.leafModel = { type: 'categorical', values: [0, 1] }
     return space
@@ -480,7 +576,7 @@ class RFModel {
       regressor: !isClassifier,
       predictProba: isClassifier,
       decisionFunction: false,
-      sampleWeight: false,
+      sampleWeight: true,
       csr: false,
       earlyStopping: false,
       featureImportances: true

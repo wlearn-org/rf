@@ -25,6 +25,10 @@
 #include <math.h>
 #include <float.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* ---------- error handling ---------- */
 
 static char rf_last_error[512] = "";
@@ -61,6 +65,13 @@ void rf_params_init(rf_params_t *p) {
     p->alpha_trim = 0.0;
     p->monotonic_cst = NULL;
     p->n_monotonic_cst = 0;
+    p->sample_weight = NULL;
+    p->n_sample_weight = 0;
+    p->histogram = 0;
+    p->max_bins = 256;
+    p->jarf = 0;
+    p->jarf_n_estimators = 50;
+    p->jarf_max_depth = 6;
 }
 
 /* ---------- tree helpers ---------- */
@@ -157,9 +168,9 @@ static void sort_indices_by_feature(int32_t *indices, int32_t n, const double *X
 
 /* ---------- impurity ---------- */
 
-static double gini_impurity(const double *counts, int32_t n_classes, int32_t n) {
-    if (n == 0) return 0.0;
-    double inv_n = 1.0 / (double)n;
+static double gini_impurity(const double *counts, int32_t n_classes, double w_total) {
+    if (w_total <= 0.0) return 0.0;
+    double inv_n = 1.0 / w_total;
     double sum_sq = 0.0;
     for (int32_t c = 0; c < n_classes; c++) {
         double p = counts[c] * inv_n;
@@ -168,23 +179,30 @@ static double gini_impurity(const double *counts, int32_t n_classes, int32_t n) 
     return 1.0 - sum_sq;
 }
 
-static double mse_impurity(const double *y, const int32_t *indices, int32_t n) {
+static double mse_impurity(const double *y, const int32_t *indices, int32_t n,
+                            const double *sw) {
     if (n == 0) return 0.0;
-    double mean = 0.0;
-    for (int32_t i = 0; i < n; i++) mean += y[indices[i]];
-    mean /= (double)n;
+    double w_total = 0.0, wsum_y = 0.0;
+    for (int32_t i = 0; i < n; i++) {
+        double w = sw ? sw[indices[i]] : 1.0;
+        w_total += w;
+        wsum_y += w * y[indices[i]];
+    }
+    if (w_total <= 0.0) return 0.0;
+    double mean = wsum_y / w_total;
     double mse = 0.0;
     for (int32_t i = 0; i < n; i++) {
+        double w = sw ? sw[indices[i]] : 1.0;
         double d = y[indices[i]] - mean;
-        mse += d * d;
+        mse += w * d * d;
     }
-    return mse / (double)n;
+    return mse / w_total;
 }
 
 /* Shannon entropy: H = -sum(p * log2(p)) */
-static double entropy_impurity(const double *counts, int32_t n_classes, int32_t n) {
-    if (n == 0) return 0.0;
-    double inv_n = 1.0 / (double)n;
+static double entropy_impurity(const double *counts, int32_t n_classes, double w_total) {
+    if (w_total <= 0.0) return 0.0;
+    double inv_n = 1.0 / w_total;
     double ent = 0.0;
     for (int32_t c = 0; c < n_classes; c++) {
         double p = counts[c] * inv_n;
@@ -197,10 +215,10 @@ static double entropy_impurity(const double *counts, int32_t n_classes, int32_t 
  * Returns a distance (higher = better split), not an impurity.
  * gain = sum_c (sqrt(p_l_c) - sqrt(p_r_c))^2 */
 static double hellinger_gain(const double *counts_l, const double *counts_r,
-                              int32_t n_classes, int32_t n_left, int32_t n_right) {
-    if (n_left == 0 || n_right == 0) return 0.0;
-    double inv_l = 1.0 / (double)n_left;
-    double inv_r = 1.0 / (double)n_right;
+                              int32_t n_classes, double w_left, double w_right) {
+    if (w_left <= 0.0 || w_right <= 0.0) return 0.0;
+    double inv_l = 1.0 / w_left;
+    double inv_r = 1.0 / w_right;
     double dist = 0.0;
     for (int32_t c = 0; c < n_classes; c++) {
         double d = sqrt(counts_l[c] * inv_l) - sqrt(counts_r[c] * inv_r);
@@ -210,32 +228,40 @@ static double hellinger_gain(const double *counts_l, const double *counts_r,
 }
 
 /* MAE impurity: mean absolute deviation from the node mean */
-static double mae_impurity(const double *y, const int32_t *indices, int32_t n) {
+static double mae_impurity(const double *y, const int32_t *indices, int32_t n,
+                            const double *sw) {
     if (n == 0) return 0.0;
-    double mean = 0.0;
-    for (int32_t i = 0; i < n; i++) mean += y[indices[i]];
-    mean /= (double)n;
+    double w_total = 0.0, wsum_y = 0.0;
+    for (int32_t i = 0; i < n; i++) {
+        double w = sw ? sw[indices[i]] : 1.0;
+        w_total += w;
+        wsum_y += w * y[indices[i]];
+    }
+    if (w_total <= 0.0) return 0.0;
+    double mean = wsum_y / w_total;
     double mae = 0.0;
     for (int32_t i = 0; i < n; i++) {
+        double w = sw ? sw[indices[i]] : 1.0;
         double d = y[indices[i]] - mean;
-        mae += (d >= 0 ? d : -d);
+        mae += w * (d >= 0 ? d : -d);
     }
-    return mae / (double)n;
+    return mae / w_total;
 }
 
 /* Classification impurity dispatch by criterion */
-static double cls_impurity(const double *counts, int32_t n_classes, int32_t n, int32_t criterion) {
+static double cls_impurity(const double *counts, int32_t n_classes, double w_total, int32_t criterion) {
     switch (criterion) {
-        case 1: return entropy_impurity(counts, n_classes, n);
-        default: return gini_impurity(counts, n_classes, n);
+        case 1: return entropy_impurity(counts, n_classes, w_total);
+        default: return gini_impurity(counts, n_classes, w_total);
     }
 }
 
 /* Regression impurity dispatch by criterion */
-static double reg_impurity(const double *y, const int32_t *indices, int32_t n, int32_t criterion) {
+static double reg_impurity(const double *y, const int32_t *indices, int32_t n,
+                            int32_t criterion, const double *sw) {
     switch (criterion) {
-        case 1: return mae_impurity(y, indices, n);
-        default: return mse_impurity(y, indices, n);
+        case 1: return mae_impurity(y, indices, n, sw);
+        default: return mse_impurity(y, indices, n, sw);
     }
 }
 
@@ -294,6 +320,145 @@ static void sample_features_weighted(int32_t *features, int32_t n_features,
     free(available);
 }
 
+/* ---------- histogram binning ---------- */
+
+static int cmp_double(const void *a, const void *b) {
+    double va = *(const double *)a;
+    double vb = *(const double *)b;
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    return 0;
+}
+
+static rf_bins_t *rf_bins_create(const double *X, int32_t nrow, int32_t ncol, int32_t max_bins) {
+    if (max_bins < 2) max_bins = 2;
+    if (max_bins > 256) max_bins = 256;
+
+    rf_bins_t *bins = (rf_bins_t *)calloc(1, sizeof(rf_bins_t));
+    if (!bins) return NULL;
+    bins->max_bins = max_bins;
+    bins->ncol = ncol;
+    bins->nrow = nrow;
+    bins->binned = (uint8_t *)malloc((size_t)nrow * ncol);
+    bins->bin_edges = (double *)calloc((size_t)ncol * (max_bins - 1), sizeof(double));
+    bins->n_bins = (int32_t *)calloc((size_t)ncol, sizeof(int32_t));
+    if (!bins->binned || !bins->bin_edges || !bins->n_bins) {
+        free(bins->binned); free(bins->bin_edges); free(bins->n_bins);
+        free(bins); return NULL;
+    }
+
+    /* Temporary buffer for sorted non-NaN values */
+    double *sorted = (double *)malloc((size_t)nrow * sizeof(double));
+    if (!sorted) {
+        free(bins->binned); free(bins->bin_edges); free(bins->n_bins);
+        free(bins); return NULL;
+    }
+
+    for (int32_t j = 0; j < ncol; j++) {
+        /* Collect non-NaN values */
+        int32_t n_valid = 0;
+        for (int32_t i = 0; i < nrow; i++) {
+            double v = X[(size_t)i * ncol + j];
+            if (!isnan(v)) sorted[n_valid++] = v;
+        }
+
+        if (n_valid == 0) {
+            /* All NaN: 0 bins, all binned to 0 */
+            bins->n_bins[j] = 0;
+            for (int32_t i = 0; i < nrow; i++)
+                bins->binned[(size_t)i * ncol + j] = 0;
+            continue;
+        }
+
+        qsort(sorted, (size_t)n_valid, sizeof(double), cmp_double);
+
+        /* Extract unique values, then place edges at midpoints between
+         * consecutive unique values.  When n_unique > max_bins, subsample
+         * the unique values at quantile-spaced positions first. */
+        int32_t n_unique = 1;
+        for (int32_t i = 1; i < n_valid; i++) {
+            if (sorted[i] != sorted[i - 1]) n_unique++;
+        }
+
+        /* Build array of unique values (reuse tail of sorted buffer) */
+        double *uniq = sorted + n_valid;  /* we allocated nrow, only n_valid used */
+        /* If n_valid == nrow we need a separate buffer -- but typically n_valid <= nrow.
+         * To be safe, allocate uniq separately only if needed. */
+        double *uniq_alloc = NULL;
+        if (n_unique > n_valid - n_valid) {
+            /* Always safe: n_unique <= n_valid, but let's just allocate */
+            uniq_alloc = (double *)malloc((size_t)n_unique * sizeof(double));
+            uniq = uniq_alloc;
+        }
+        {
+            int32_t ui = 0;
+            uniq[ui++] = sorted[0];
+            for (int32_t i = 1; i < n_valid; i++) {
+                if (sorted[i] != sorted[i - 1]) uniq[ui++] = sorted[i];
+            }
+        }
+
+        int32_t actual_bins = n_unique < max_bins ? n_unique : max_bins;
+        int32_t n_edges = actual_bins - 1;
+        double *edges = bins->bin_edges + (size_t)j * (max_bins - 1);
+
+        if (n_unique <= max_bins) {
+            /* Few unique values: place edge at midpoint of each consecutive pair */
+            for (int32_t k = 0; k < n_edges; k++) {
+                edges[k] = (uniq[k] + uniq[k + 1]) * 0.5;
+            }
+        } else {
+            /* Many unique values: pick quantile-spaced unique values, then midpoints */
+            for (int32_t k = 0; k < n_edges; k++) {
+                double q = (double)(k + 1) / (double)actual_bins;
+                int32_t idx = (int32_t)(q * (n_unique - 1));
+                if (idx >= n_unique - 1) idx = n_unique - 2;
+                edges[k] = (uniq[idx] + uniq[idx + 1]) * 0.5;
+            }
+            /* Deduplicate edges (collapse equal adjacent) */
+            int32_t deduped = 0;
+            for (int32_t k = 0; k < n_edges; k++) {
+                if (deduped == 0 || edges[k] > edges[deduped - 1]) {
+                    edges[deduped++] = edges[k];
+                }
+            }
+            n_edges = deduped;
+            actual_bins = n_edges + 1;
+        }
+        free(uniq_alloc);
+        bins->n_bins[j] = actual_bins;
+
+        /* Assign bins to samples using binary search */
+        for (int32_t i = 0; i < nrow; i++) {
+            double v = X[(size_t)i * ncol + j];
+            if (isnan(v)) {
+                /* NaN gets a special marker: max_bins (handled separately in split search) */
+                bins->binned[(size_t)i * ncol + j] = (uint8_t)(actual_bins);
+                continue;
+            }
+            /* Binary search for bin */
+            int32_t lo = 0, hi = n_edges;
+            while (lo < hi) {
+                int32_t mid = (lo + hi) / 2;
+                if (v <= edges[mid]) hi = mid;
+                else lo = mid + 1;
+            }
+            bins->binned[(size_t)i * ncol + j] = (uint8_t)lo;
+        }
+    }
+
+    free(sorted);
+    return bins;
+}
+
+static void rf_bins_free(rf_bins_t *bins) {
+    if (!bins) return;
+    free(bins->binned);
+    free(bins->bin_edges);
+    free(bins->n_bins);
+    free(bins);
+}
+
 /* ---------- build context ---------- */
 
 typedef struct {
@@ -328,7 +493,22 @@ typedef struct {
     int32_t *sample_indices_buf; /* for leaf_model: length nrow */
     /* NaN scratch */
     int32_t *nan_indices;  /* length nrow, temp storage for NaN sample indices */
+    /* Sample weights (NULL = uniform) */
+    const double *sample_weight;
+    /* Histogram binning (NULL = standard splits) */
+    const rf_bins_t *bins;
+    /* Histogram scratch: per-bin accumulators (max 256 bins) */
+    double *hist_cls;      /* max_bins * n_classes (for classification) */
+    double *hist_wsum;     /* max_bins (weight sum per bin, for regression) */
+    double *hist_wy;       /* max_bins (weighted y sum per bin, for regression) */
+    double *hist_wy2;      /* max_bins (weighted y^2 sum per bin, for regression) */
+    int32_t *hist_cnt;     /* max_bins (sample count per bin) */
 } build_ctx_t;
+
+/* Helper: get sample weight (1.0 if no weights) */
+static inline double sw_get(const double *sw, int32_t idx) {
+    return sw ? sw[idx] : 1.0;
+}
 
 /* ---------- find best split ---------- */
 
@@ -343,16 +523,16 @@ typedef struct {
 /* Helper: compute gain for a cls split (works with NaN-augmented counts).
  * Returns gain; caller compares against best. */
 static double cls_split_gain(const double *counts_l, const double *counts_r,
-                              int32_t n_classes, int32_t n_left, int32_t n_right,
-                              int32_t n_total, double parent_impurity, int32_t crit) {
+                              int32_t n_classes, double w_left, double w_right,
+                              double w_total, double parent_impurity, int32_t crit) {
     if (crit == 2) {
-        return hellinger_gain(counts_l, counts_r, n_classes, n_left, n_right);
+        return hellinger_gain(counts_l, counts_r, n_classes, w_left, w_right);
     }
-    double imp_l = cls_impurity(counts_l, n_classes, n_left, crit);
-    double imp_r = cls_impurity(counts_r, n_classes, n_right, crit);
+    double imp_l = cls_impurity(counts_l, n_classes, w_left, crit);
+    double imp_r = cls_impurity(counts_r, n_classes, w_right, crit);
     return parent_impurity
-        - ((double)n_left / n_total) * imp_l
-        - ((double)n_right / n_total) * imp_r;
+        - (w_left / w_total) * imp_l
+        - (w_right / w_total) * imp_r;
 }
 
 /* Helper: check monotonic constraint on regression split.
@@ -378,6 +558,7 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                                        double lower_bound, double upper_bound) {
     (void)tree;
     split_result_t best = { -1, 0.0, -1.0, 0, 0 };
+    const double *sw = ctx->sample_weight;
 
     /* Feature sampling: uniform or HRF-weighted */
     if (ctx->heterogeneous && ctx->depth_usage && ctx->hrf_weights) {
@@ -412,18 +593,22 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
 
         /* NaN statistics for classification */
         double *nan_cls_counts = NULL;
-        double nan_sum = 0, nan_sumsq = 0;
+        double nan_wsum = 0, nan_wsum_y = 0, nan_wsum_y2 = 0;
         if (n_nan > 0 && ctx->task == 0) {
             nan_cls_counts = (double *)calloc((size_t)ctx->n_classes, sizeof(double));
             for (int32_t i = 0; i < n_nan; i++) {
-                nan_cls_counts[(int32_t)ctx->y[ctx->nan_indices[i]]]++;
+                double w = sw_get(sw, ctx->nan_indices[i]);
+                nan_cls_counts[(int32_t)ctx->y[ctx->nan_indices[i]]] += w;
+                nan_wsum += w;
             }
         }
         if (n_nan > 0 && ctx->task == 1) {
             for (int32_t i = 0; i < n_nan; i++) {
+                double w = sw_get(sw, ctx->nan_indices[i]);
                 double yv = ctx->y[ctx->nan_indices[i]];
-                nan_sum += yv;
-                nan_sumsq += yv * yv;
+                nan_wsum += w;
+                nan_wsum_y += w * yv;
+                nan_wsum_y2 += w * yv * yv;
             }
         }
 
@@ -448,30 +633,34 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                 if (ctx->task == 0) {
                     memset(ctx->cls_counts_l, 0, (size_t)ctx->n_classes * sizeof(double));
                     memset(ctx->cls_counts_r, 0, (size_t)ctx->n_classes * sizeof(double));
+                    double w_left = 0, w_right = 0;
 
                     for (int32_t i = 0; i < n_valid; i++) {
                         double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
                         int32_t c = (int32_t)ctx->y[ctx->idx_buf[i]];
-                        if (v <= thr) { ctx->cls_counts_l[c]++; n_left++; }
-                        else { ctx->cls_counts_r[c]++; }
+                        double w = sw_get(sw, ctx->idx_buf[i]);
+                        if (v <= thr) { ctx->cls_counts_l[c] += w; w_left += w; n_left++; }
+                        else { ctx->cls_counts_r[c] += w; w_right += w; }
                     }
                     /* Add NaN samples to chosen side */
                     if (n_nan > 0 && nan_cls_counts) {
                         if (try_nan_dir == 0) {
                             for (int32_t c = 0; c < ctx->n_classes; c++)
                                 ctx->cls_counts_l[c] += nan_cls_counts[c];
+                            w_left += nan_wsum;
                             n_left += n_nan;
                         } else {
                             for (int32_t c = 0; c < ctx->n_classes; c++)
                                 ctx->cls_counts_r[c] += nan_cls_counts[c];
+                            w_right += nan_wsum;
                         }
                     }
                     int32_t n_right = n - n_left;
                     if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
 
                     double gain = cls_split_gain(ctx->cls_counts_l, ctx->cls_counts_r,
-                                                  ctx->n_classes, n_left, n_right,
-                                                  n, parent_impurity, crit);
+                                                  ctx->n_classes, w_left, w_right,
+                                                  w_left + w_right, parent_impurity, crit);
                     if (gain > best.gain) {
                         best.feature = feat;
                         best.threshold = thr;
@@ -481,21 +670,24 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                     }
                 } else {
                     /* Regression */
-                    double sum_l = 0, sum_r = 0;
+                    double wsum_l = 0, wsum_r = 0, wsum_yl = 0, wsum_yr = 0;
                     for (int32_t i = 0; i < n_valid; i++) {
                         double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
-                        if (v <= thr) { sum_l += ctx->y[ctx->idx_buf[i]]; n_left++; }
-                        else { sum_r += ctx->y[ctx->idx_buf[i]]; }
+                        double w = sw_get(sw, ctx->idx_buf[i]);
+                        double yv = ctx->y[ctx->idx_buf[i]];
+                        if (v <= thr) { wsum_yl += w * yv; wsum_l += w; n_left++; }
+                        else { wsum_yr += w * yv; wsum_r += w; }
                     }
                     if (n_nan > 0) {
-                        if (try_nan_dir == 0) { sum_l += nan_sum; n_left += n_nan; }
-                        else { sum_r += nan_sum; }
+                        if (try_nan_dir == 0) { wsum_yl += nan_wsum_y; wsum_l += nan_wsum; n_left += n_nan; }
+                        else { wsum_yr += nan_wsum_y; wsum_r += nan_wsum; }
                     }
                     int32_t n_right = n - n_left;
                     if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+                    if (wsum_l <= 0.0 || wsum_r <= 0.0) continue;
 
-                    double mean_l = sum_l / n_left;
-                    double mean_r = sum_r / n_right;
+                    double mean_l = wsum_yl / wsum_l;
+                    double mean_r = wsum_yr / wsum_r;
 
                     /* Check monotonic constraint */
                     if (!mono_check(ctx->monotonic_cst, feat, mean_l, mean_r,
@@ -505,40 +697,45 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                     if (crit == 1) {
                         for (int32_t i = 0; i < n_valid; i++) {
                             double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
+                            double w = sw_get(sw, ctx->idx_buf[i]);
                             double yv = ctx->y[ctx->idx_buf[i]];
-                            if (v <= thr) imp_l += fabs(yv - mean_l);
-                            else imp_r += fabs(yv - mean_r);
+                            if (v <= thr) imp_l += w * fabs(yv - mean_l);
+                            else imp_r += w * fabs(yv - mean_r);
                         }
                         if (n_nan > 0) {
                             for (int32_t i = 0; i < n_nan; i++) {
+                                double w = sw_get(sw, ctx->nan_indices[i]);
                                 double yv = ctx->y[ctx->nan_indices[i]];
-                                if (try_nan_dir == 0) imp_l += fabs(yv - mean_l);
-                                else imp_r += fabs(yv - mean_r);
+                                if (try_nan_dir == 0) imp_l += w * fabs(yv - mean_l);
+                                else imp_r += w * fabs(yv - mean_r);
                             }
                         }
-                        imp_l /= n_left;
-                        imp_r /= n_right;
+                        imp_l /= wsum_l;
+                        imp_r /= wsum_r;
                     } else {
                         for (int32_t i = 0; i < n_valid; i++) {
                             double v = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
+                            double w = sw_get(sw, ctx->idx_buf[i]);
                             double yv = ctx->y[ctx->idx_buf[i]];
-                            if (v <= thr) { double d = yv - mean_l; imp_l += d * d; }
-                            else { double d = yv - mean_r; imp_r += d * d; }
+                            if (v <= thr) { double d = yv - mean_l; imp_l += w * d * d; }
+                            else { double d = yv - mean_r; imp_r += w * d * d; }
                         }
                         if (n_nan > 0) {
                             for (int32_t i = 0; i < n_nan; i++) {
+                                double w = sw_get(sw, ctx->nan_indices[i]);
                                 double yv = ctx->y[ctx->nan_indices[i]];
-                                if (try_nan_dir == 0) { double d = yv - mean_l; imp_l += d * d; }
-                                else { double d = yv - mean_r; imp_r += d * d; }
+                                if (try_nan_dir == 0) { double d = yv - mean_l; imp_l += w * d * d; }
+                                else { double d = yv - mean_r; imp_r += w * d * d; }
                             }
                         }
-                        imp_l /= n_left;
-                        imp_r /= n_right;
+                        imp_l /= wsum_l;
+                        imp_r /= wsum_r;
                     }
 
+                    double w_total = wsum_l + wsum_r;
                     double gain = parent_impurity
-                        - ((double)n_left / n) * imp_l
-                        - ((double)n_right / n) * imp_r;
+                        - (wsum_l / w_total) * imp_l
+                        - (wsum_r / w_total) * imp_r;
                     if (gain > best.gain) {
                         best.feature = feat;
                         best.threshold = thr;
@@ -563,17 +760,22 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                 memset(base_counts_l, 0, (size_t)ctx->n_classes * sizeof(double));
                 memset(base_counts_r, 0, (size_t)ctx->n_classes * sizeof(double));
 
+                double w_base_l = 0, w_base_r = 0;
                 for (int32_t i = 0; i < n_valid; i++) {
                     int32_t c = (int32_t)ctx->y[ctx->idx_buf[i]];
-                    base_counts_r[c]++;
+                    double w = sw_get(sw, ctx->idx_buf[i]);
+                    base_counts_r[c] += w;
+                    w_base_r += w;
                 }
 
                 for (int32_t i = 0; i < n_valid - 1; i++) {
                     int32_t c = (int32_t)ctx->y[ctx->idx_buf[i]];
-                    base_counts_l[c]++;
-                    base_counts_r[c]--;
+                    double w = sw_get(sw, ctx->idx_buf[i]);
+                    base_counts_l[c] += w;
+                    base_counts_r[c] -= w;
+                    w_base_l += w;
+                    w_base_r -= w;
                     int32_t base_left = i + 1;
-                    (void)(n_valid - base_left); /* base_right computed via n - n_left */
 
                     double v_cur = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
                     double v_next = ctx->X[(size_t)ctx->idx_buf[i + 1] * ctx->ncol + feat];
@@ -585,6 +787,10 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                         int32_t n_right = n - n_left;
 
                         if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+
+                        double w_left = w_base_l + (try_nan_dir == 0 ? nan_wsum : 0);
+                        double w_right = w_base_r + (try_nan_dir == 1 ? nan_wsum : 0);
+                        double w_total = w_left + w_right;
 
                         /* Temporarily add NaN counts for gain computation */
                         double gain;
@@ -602,13 +808,13 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                             } else {
                                 for (int32_t cc = 0; cc < ctx->n_classes; cc++) cr[cc] += nan_cls_counts[cc];
                             }
-                            gain = cls_split_gain(cl, cr, ctx->n_classes, n_left, n_right,
-                                                   n, parent_impurity, crit);
+                            gain = cls_split_gain(cl, cr, ctx->n_classes, w_left, w_right,
+                                                   w_total, parent_impurity, crit);
                             if (ctx->n_classes > 64) { free(cl); free(cr); }
                         } else {
                             gain = cls_split_gain(base_counts_l, base_counts_r,
-                                                   ctx->n_classes, n_left, n_right,
-                                                   n, parent_impurity, crit);
+                                                   ctx->n_classes, w_left, w_right,
+                                                   w_total, parent_impurity, crit);
                         }
 
                         /* Monotonic constraint check for binary classification:
@@ -618,11 +824,11 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                             if (n_nan > 0 && nan_cls_counts) {
                                 double cnt1_l = base_counts_l[1] + (try_nan_dir == 0 ? nan_cls_counts[1] : 0);
                                 double cnt1_r = base_counts_r[1] + (try_nan_dir == 1 ? nan_cls_counts[1] : 0);
-                                p1_l = cnt1_l / n_left;
-                                p1_r = cnt1_r / n_right;
+                                p1_l = cnt1_l / w_left;
+                                p1_r = cnt1_r / w_right;
                             } else {
-                                p1_l = base_counts_l[1] / n_left;
-                                p1_r = base_counts_r[1] / n_right;
+                                p1_l = base_counts_l[1] / w_left;
+                                p1_r = base_counts_r[1] / w_right;
                             }
                             if (!mono_check(ctx->monotonic_cst, feat, p1_l, p1_r,
                                              lower_bound, upper_bound)) continue;
@@ -638,22 +844,25 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                     }
                 }
             } else {
-                /* Regression: incremental sums on non-NaN */
-                double sum_all = 0, sumsq_all = 0;
+                /* Regression: incremental weighted sums on non-NaN */
+                double wsum_all = 0, wsum_y_all = 0, wsum_y2_all = 0;
                 for (int32_t i = 0; i < n_valid; i++) {
+                    double w = sw_get(sw, ctx->idx_buf[i]);
                     double yv = ctx->y[ctx->idx_buf[i]];
-                    sum_all += yv;
-                    sumsq_all += yv * yv;
+                    wsum_all += w;
+                    wsum_y_all += w * yv;
+                    wsum_y2_all += w * yv * yv;
                 }
 
-                double sum_l = 0, sumsq_l = 0;
+                double wsum_l = 0, wsum_yl = 0, wsum_y2l = 0;
 
                 for (int32_t i = 0; i < n_valid - 1; i++) {
+                    double w = sw_get(sw, ctx->idx_buf[i]);
                     double yv = ctx->y[ctx->idx_buf[i]];
-                    sum_l += yv;
-                    sumsq_l += yv * yv;
+                    wsum_l += w;
+                    wsum_yl += w * yv;
+                    wsum_y2l += w * yv * yv;
                     int32_t base_left = i + 1;
-                    (void)(n_valid - base_left); /* base_right computed via n - n_left */
 
                     double v_cur = ctx->X[(size_t)ctx->idx_buf[i] * ctx->ncol + feat];
                     double v_next = ctx->X[(size_t)ctx->idx_buf[i + 1] * ctx->ncol + feat];
@@ -666,11 +875,15 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
 
                         if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
 
-                        /* Compute means with NaN samples added */
-                        double eff_sum_l = sum_l + (try_nan_dir == 0 ? nan_sum : 0);
-                        double eff_sum_r = (sum_all - sum_l) + (try_nan_dir == 1 ? nan_sum : 0);
-                        double mean_l = eff_sum_l / n_left;
-                        double mean_r = eff_sum_r / n_right;
+                        /* Compute weighted means with NaN samples added */
+                        double eff_wsum_l = wsum_l + (try_nan_dir == 0 ? nan_wsum : 0);
+                        double eff_wsum_r = (wsum_all - wsum_l) + (try_nan_dir == 1 ? nan_wsum : 0);
+                        if (eff_wsum_l <= 0.0 || eff_wsum_r <= 0.0) continue;
+
+                        double eff_wyl = wsum_yl + (try_nan_dir == 0 ? nan_wsum_y : 0);
+                        double eff_wyr = (wsum_y_all - wsum_yl) + (try_nan_dir == 1 ? nan_wsum_y : 0);
+                        double mean_l = eff_wyl / eff_wsum_l;
+                        double mean_r = eff_wyr / eff_wsum_r;
 
                         /* Check monotonic constraint */
                         if (!mono_check(ctx->monotonic_cst, feat, mean_l, mean_r,
@@ -681,37 +894,42 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
                             /* MAE: must compute full pass */
                             double mad_l = 0, mad_r = 0;
                             for (int32_t j = 0; j <= i; j++) {
-                                mad_l += fabs(ctx->y[ctx->idx_buf[j]] - mean_l);
+                                double wj = sw_get(sw, ctx->idx_buf[j]);
+                                mad_l += wj * fabs(ctx->y[ctx->idx_buf[j]] - mean_l);
                             }
                             for (int32_t j = i + 1; j < n_valid; j++) {
-                                mad_r += fabs(ctx->y[ctx->idx_buf[j]] - mean_r);
+                                double wj = sw_get(sw, ctx->idx_buf[j]);
+                                mad_r += wj * fabs(ctx->y[ctx->idx_buf[j]] - mean_r);
                             }
                             if (n_nan > 0) {
                                 for (int32_t j = 0; j < n_nan; j++) {
+                                    double wj = sw_get(sw, ctx->nan_indices[j]);
                                     double nyv = ctx->y[ctx->nan_indices[j]];
-                                    if (try_nan_dir == 0) mad_l += fabs(nyv - mean_l);
-                                    else mad_r += fabs(nyv - mean_r);
+                                    if (try_nan_dir == 0) mad_l += wj * fabs(nyv - mean_l);
+                                    else mad_r += wj * fabs(nyv - mean_r);
                                 }
                             }
-                            mad_l /= n_left;
-                            mad_r /= n_right;
+                            mad_l /= eff_wsum_l;
+                            mad_r /= eff_wsum_r;
+                            double eff_w_total = eff_wsum_l + eff_wsum_r;
                             gain = parent_impurity
-                                - ((double)n_left / n) * mad_l
-                                - ((double)n_right / n) * mad_r;
+                                - (eff_wsum_l / eff_w_total) * mad_l
+                                - (eff_wsum_r / eff_w_total) * mad_r;
                         } else {
                             /* MSE: incremental for non-NaN, add NaN contribution */
-                            double eff_sumsq_l = sumsq_l + (try_nan_dir == 0 ? nan_sumsq : 0);
-                            double total_sumsq = sumsq_all + nan_sumsq;
-                            double eff_sumsq_r = total_sumsq - eff_sumsq_l;
+                            double eff_wy2l = wsum_y2l + (try_nan_dir == 0 ? nan_wsum_y2 : 0);
+                            double total_wy2 = wsum_y2_all + nan_wsum_y2;
+                            double eff_wy2r = total_wy2 - eff_wy2l;
 
-                            double mse_l = eff_sumsq_l / n_left - mean_l * mean_l;
-                            double mse_r = eff_sumsq_r / n_right - mean_r * mean_r;
+                            double mse_l = eff_wy2l / eff_wsum_l - mean_l * mean_l;
+                            double mse_r = eff_wy2r / eff_wsum_r - mean_r * mean_r;
                             if (mse_l < 0) mse_l = 0;
                             if (mse_r < 0) mse_r = 0;
 
+                            double eff_w_total = eff_wsum_l + eff_wsum_r;
                             gain = parent_impurity
-                                - ((double)n_left / n) * mse_l
-                                - ((double)n_right / n) * mse_r;
+                                - (eff_wsum_l / eff_w_total) * mse_l
+                                - (eff_wsum_r / eff_w_total) * mse_r;
                         }
 
                         if (gain > best.gain) {
@@ -730,6 +948,280 @@ static split_result_t find_best_split(build_ctx_t *ctx, rf_tree_t *tree,
     return best;
 }
 
+/* ---------- histogram split search ---------- */
+
+static split_result_t find_best_split_hist(build_ctx_t *ctx,
+                                            int32_t *sample_indices, int32_t n,
+                                            double parent_impurity, int32_t depth,
+                                            double lower_bound, double upper_bound) {
+    split_result_t best = { -1, 0.0, -1.0, 0, 0 };
+    const rf_bins_t *bins = ctx->bins;
+    const double *sw = ctx->sample_weight;
+    int32_t max_b = bins->max_bins;
+
+    /* Feature sampling */
+    if (ctx->heterogeneous && ctx->depth_usage && ctx->hrf_weights) {
+        int32_t d_idx = depth < HRF_MAX_DEPTH ? depth : HRF_MAX_DEPTH - 1;
+        double *usage_row = ctx->depth_usage + (size_t)d_idx * ctx->ncol;
+        for (int32_t f = 0; f < ctx->ncol; f++)
+            ctx->hrf_weights[f] = 1.0 / (1.0 + usage_row[f]);
+        sample_features_weighted(ctx->feature_buf, ctx->ncol, ctx->max_features,
+                                  ctx->rng, ctx->hrf_weights);
+    } else {
+        sample_features_uniform(ctx->feature_buf, ctx->ncol, ctx->max_features, ctx->rng);
+    }
+
+    int32_t crit = ctx->criterion;
+
+    for (int32_t fi = 0; fi < ctx->max_features && fi < ctx->ncol; fi++) {
+        int32_t feat = ctx->feature_buf[fi];
+        int32_t n_feat_bins = bins->n_bins[feat];
+        if (n_feat_bins < 2) continue;  /* constant or all-NaN feature */
+
+        uint8_t nan_bin = (uint8_t)n_feat_bins;  /* NaN marker */
+        double *edges = bins->bin_edges + (size_t)feat * (max_b - 1);
+
+        if (ctx->task == 0) {
+            /* Classification: build per-bin class count histograms */
+            int32_t nc = ctx->n_classes;
+            double *hist = ctx->hist_cls;  /* n_feat_bins * nc */
+            double *wsum_bin = ctx->hist_wsum;
+            int32_t *cnt_bin = ctx->hist_cnt;
+            memset(hist, 0, (size_t)n_feat_bins * nc * sizeof(double));
+            memset(wsum_bin, 0, (size_t)n_feat_bins * sizeof(double));
+            memset(cnt_bin, 0, (size_t)n_feat_bins * sizeof(int32_t));
+
+            /* NaN accumulators */
+            double nan_wsum = 0;
+            int32_t nan_cnt = 0;
+            double nan_cls[64];
+            double *nan_cls_p = (nc <= 64) ? nan_cls : (double *)calloc((size_t)nc, sizeof(double));
+            if (nc <= 64) memset(nan_cls, 0, sizeof(nan_cls));
+
+            for (int32_t i = 0; i < n; i++) {
+                int32_t si = sample_indices[i];
+                uint8_t b = bins->binned[(size_t)si * bins->ncol + feat];
+                double w = sw_get(sw, si);
+                int32_t c = (int32_t)ctx->y[si];
+                if (b == nan_bin) {
+                    nan_cls_p[c] += w;
+                    nan_wsum += w;
+                    nan_cnt++;
+                } else {
+                    hist[(size_t)b * nc + c] += w;
+                    wsum_bin[b] += w;
+                    cnt_bin[b]++;
+                }
+            }
+
+            /* Scan bins left-to-right for cumulative counts */
+            double *cum_l = ctx->cls_counts_l;
+            double *cum_r = ctx->cls_counts_r;
+            memset(cum_l, 0, (size_t)nc * sizeof(double));
+            double w_cum_l = 0;
+            int32_t cnt_cum_l = 0;
+
+            /* Compute totals for right side */
+            double w_total_valid = 0;
+            int32_t cnt_total_valid = 0;
+            memset(cum_r, 0, (size_t)nc * sizeof(double));
+            for (int32_t b = 0; b < n_feat_bins; b++) {
+                for (int32_t c = 0; c < nc; c++)
+                    cum_r[c] += hist[(size_t)b * nc + c];
+                w_total_valid += wsum_bin[b];
+                cnt_total_valid += cnt_bin[b];
+            }
+
+            int nan_dirs = (nan_cnt > 0) ? 2 : 1;
+
+            for (int32_t b = 0; b < n_feat_bins - 1; b++) {
+                /* Move bin b from right to left */
+                for (int32_t c = 0; c < nc; c++) {
+                    cum_l[c] += hist[(size_t)b * nc + c];
+                    cum_r[c] -= hist[(size_t)b * nc + c];
+                }
+                w_cum_l += wsum_bin[b];
+                cnt_cum_l += cnt_bin[b];
+                double w_cum_r = w_total_valid - w_cum_l;
+                (void)(cnt_total_valid); /* cnt tracked via n - n_left */
+
+                for (int nd = 0; nd < nan_dirs; nd++) {
+                    int8_t try_nan_dir = (int8_t)nd;
+                    int32_t n_left = cnt_cum_l + (try_nan_dir == 0 ? nan_cnt : 0);
+                    int32_t n_right = n - n_left;
+                    if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+
+                    double w_left = w_cum_l + (try_nan_dir == 0 ? nan_wsum : 0);
+                    double w_right = w_cum_r + (try_nan_dir == 1 ? nan_wsum : 0);
+                    double w_tot = w_left + w_right;
+
+                    double gain;
+                    if (nan_cnt > 0) {
+                        double tmp_l[64], tmp_r[64];
+                        double *cl = (nc <= 64) ? tmp_l : (double *)malloc((size_t)nc * sizeof(double));
+                        double *cr = (nc <= 64) ? tmp_r : (double *)malloc((size_t)nc * sizeof(double));
+                        for (int32_t c = 0; c < nc; c++) { cl[c] = cum_l[c]; cr[c] = cum_r[c]; }
+                        if (try_nan_dir == 0) {
+                            for (int32_t c = 0; c < nc; c++) cl[c] += nan_cls_p[c];
+                        } else {
+                            for (int32_t c = 0; c < nc; c++) cr[c] += nan_cls_p[c];
+                        }
+                        gain = cls_split_gain(cl, cr, nc, w_left, w_right, w_tot, parent_impurity, crit);
+                        if (nc > 64) { free(cl); free(cr); }
+                    } else {
+                        gain = cls_split_gain(cum_l, cum_r, nc, w_left, w_right, w_tot, parent_impurity, crit);
+                    }
+
+                    /* Monotonic check for binary cls */
+                    if (ctx->monotonic_cst && nc == 2) {
+                        double p1_l, p1_r;
+                        if (nan_cnt > 0) {
+                            p1_l = (cum_l[1] + (try_nan_dir == 0 ? nan_cls_p[1] : 0)) / w_left;
+                            p1_r = (cum_r[1] + (try_nan_dir == 1 ? nan_cls_p[1] : 0)) / w_right;
+                        } else {
+                            p1_l = cum_l[1] / w_left;
+                            p1_r = cum_r[1] / w_right;
+                        }
+                        if (!mono_check(ctx->monotonic_cst, feat, p1_l, p1_r,
+                                         lower_bound, upper_bound)) continue;
+                    }
+
+                    if (gain > best.gain) {
+                        best.feature = feat;
+                        best.threshold = edges[b];  /* use bin edge as threshold */
+                        best.gain = gain;
+                        best.split_pos = n_left;
+                        best.nan_dir = try_nan_dir;
+                    }
+                }
+            }
+            if (nc > 64) free(nan_cls_p);
+        } else {
+            /* Regression: build per-bin wsum, wy, wy2 histograms */
+            double *wsum_bin = ctx->hist_wsum;
+            double *wy_bin = ctx->hist_wy;
+            double *wy2_bin = ctx->hist_wy2;
+            int32_t *cnt_bin = ctx->hist_cnt;
+            memset(wsum_bin, 0, (size_t)n_feat_bins * sizeof(double));
+            memset(wy_bin, 0, (size_t)n_feat_bins * sizeof(double));
+            memset(wy2_bin, 0, (size_t)n_feat_bins * sizeof(double));
+            memset(cnt_bin, 0, (size_t)n_feat_bins * sizeof(int32_t));
+
+            double nan_wsum = 0, nan_wy = 0, nan_wy2 = 0;
+            int32_t nan_cnt = 0;
+
+            for (int32_t i = 0; i < n; i++) {
+                int32_t si = sample_indices[i];
+                uint8_t b = bins->binned[(size_t)si * bins->ncol + feat];
+                double w = sw_get(sw, si);
+                double yv = ctx->y[si];
+                if (b == (uint8_t)n_feat_bins) {
+                    nan_wsum += w;
+                    nan_wy += w * yv;
+                    nan_wy2 += w * yv * yv;
+                    nan_cnt++;
+                } else {
+                    wsum_bin[b] += w;
+                    wy_bin[b] += w * yv;
+                    wy2_bin[b] += w * yv * yv;
+                    cnt_bin[b]++;
+                }
+            }
+
+            /* Scan bins left-to-right */
+            double wsum_l = 0, wy_l = 0, wy2_l = 0;
+            int32_t cnt_l = 0;
+            double wsum_all = 0, wy_all = 0, wy2_all = 0;
+            int32_t cnt_all = 0;
+            for (int32_t b = 0; b < n_feat_bins; b++) {
+                wsum_all += wsum_bin[b];
+                wy_all += wy_bin[b];
+                wy2_all += wy2_bin[b];
+                cnt_all += cnt_bin[b];
+            }
+
+            int nan_dirs = (nan_cnt > 0) ? 2 : 1;
+
+            for (int32_t b = 0; b < n_feat_bins - 1; b++) {
+                wsum_l += wsum_bin[b];
+                wy_l += wy_bin[b];
+                wy2_l += wy2_bin[b];
+                cnt_l += cnt_bin[b];
+                double wsum_r = wsum_all - wsum_l;
+                double wy_r = wy_all - wy_l;
+                double wy2_r = wy2_all - wy2_l;
+                (void)(cnt_all); /* cnt tracked via n - n_left */
+
+                for (int nd = 0; nd < nan_dirs; nd++) {
+                    int8_t try_nan_dir = (int8_t)nd;
+                    int32_t n_left = cnt_l + (try_nan_dir == 0 ? nan_cnt : 0);
+                    int32_t n_right = n - n_left;
+                    if (n_left < ctx->min_samples_leaf || n_right < ctx->min_samples_leaf) continue;
+
+                    double eff_wl = wsum_l + (try_nan_dir == 0 ? nan_wsum : 0);
+                    double eff_wr = wsum_r + (try_nan_dir == 1 ? nan_wsum : 0);
+                    if (eff_wl <= 0 || eff_wr <= 0) continue;
+
+                    double eff_wyl = wy_l + (try_nan_dir == 0 ? nan_wy : 0);
+                    double eff_wyr = wy_r + (try_nan_dir == 1 ? nan_wy : 0);
+                    double mean_l = eff_wyl / eff_wl;
+                    double mean_r = eff_wyr / eff_wr;
+
+                    if (!mono_check(ctx->monotonic_cst, feat, mean_l, mean_r,
+                                     lower_bound, upper_bound)) continue;
+
+                    double gain;
+                    if (crit == 1) {
+                        /* MAE: need full pass over samples (no incremental trick) */
+                        double mad_l = 0, mad_r = 0;
+                        for (int32_t i = 0; i < n; i++) {
+                            int32_t si = sample_indices[i];
+                            uint8_t sb = bins->binned[(size_t)si * bins->ncol + feat];
+                            double w = sw_get(sw, si);
+                            double yv = ctx->y[si];
+                            if (sb == (uint8_t)n_feat_bins) {
+                                if (try_nan_dir == 0) mad_l += w * fabs(yv - mean_l);
+                                else mad_r += w * fabs(yv - mean_r);
+                            } else if (sb <= (uint8_t)b) {
+                                mad_l += w * fabs(yv - mean_l);
+                            } else {
+                                mad_r += w * fabs(yv - mean_r);
+                            }
+                        }
+                        mad_l /= eff_wl;
+                        mad_r /= eff_wr;
+                        double w_tot = eff_wl + eff_wr;
+                        gain = parent_impurity
+                            - (eff_wl / w_tot) * mad_l
+                            - (eff_wr / w_tot) * mad_r;
+                    } else {
+                        /* MSE: incremental */
+                        double eff_wy2l = wy2_l + (try_nan_dir == 0 ? nan_wy2 : 0);
+                        double eff_wy2r = wy2_r + (try_nan_dir == 1 ? nan_wy2 : 0);
+                        double mse_l = eff_wy2l / eff_wl - mean_l * mean_l;
+                        double mse_r = eff_wy2r / eff_wr - mean_r * mean_r;
+                        if (mse_l < 0) mse_l = 0;
+                        if (mse_r < 0) mse_r = 0;
+                        double w_tot = eff_wl + eff_wr;
+                        gain = parent_impurity
+                            - (eff_wl / w_tot) * mse_l
+                            - (eff_wr / w_tot) * mse_r;
+                    }
+
+                    if (gain > best.gain) {
+                        best.feature = feat;
+                        best.threshold = edges[b];
+                        best.gain = gain;
+                        best.split_pos = n_left;
+                        best.nan_dir = try_nan_dir;
+                    }
+                }
+            }
+        }
+    }
+    return best;
+}
+
 /* ---------- recursive tree building ---------- */
 
 /* Fit ridge regression on samples reaching a leaf: y = X * beta + intercept.
@@ -741,10 +1233,15 @@ static void fit_leaf_linear(build_ctx_t *ctx, const int32_t *sample_indices, int
     int32_t dim = p + 1;  /* intercept + p features */
     double lambda = 1.0;  /* fixed regularization */
 
-    /* Initialize output to mean (fallback) */
-    double y_mean = 0.0;
-    for (int32_t i = 0; i < n; i++) y_mean += ctx->y[sample_indices[i]];
-    y_mean /= n;
+    /* Initialize output to weighted mean (fallback) */
+    const double *sw_ll = ctx->sample_weight;
+    double y_mean = 0.0, w_total_ll = 0.0;
+    for (int32_t i = 0; i < n; i++) {
+        double w = sw_get(sw_ll, sample_indices[i]);
+        y_mean += w * ctx->y[sample_indices[i]];
+        w_total_ll += w;
+    }
+    y_mean = w_total_ll > 0 ? y_mean / w_total_ll : 0.0;
     memset(out, 0, (size_t)dim * sizeof(double));
     out[0] = y_mean;
 
@@ -756,22 +1253,23 @@ static void fit_leaf_linear(build_ctx_t *ctx, const int32_t *sample_indices, int
     double *ATy = (double *)calloc((size_t)dim, sizeof(double));
     if (!ATA || !ATy) { free(ATA); free(ATy); return; }
 
-    /* Build A^T A and A^T y (A has column 0 = 1 for intercept) */
+    /* Build weighted A^T W A and A^T W y (A has column 0 = 1 for intercept) */
     for (int32_t i = 0; i < n; i++) {
         int32_t si = sample_indices[i];
         const double *xi = ctx->X + (size_t)si * ctx->ncol;
         double yi = ctx->y[si];
+        double w = sw_get(sw_ll, si);
 
         /* Row of A: [1, x0, x1, ..., x_{p-1}] */
-        ATA[0] += 1.0;  /* A[i,0]*A[i,0] */
-        ATy[0] += yi;
+        ATA[0] += w;  /* w * A[i,0]*A[i,0] */
+        ATy[0] += w * yi;
         for (int32_t j = 0; j < p; j++) {
-            ATA[(j + 1) * dim] += xi[j];      /* A[i,0]*A[i,j+1] */
-            ATA[j + 1] += xi[j];              /* symmetric */
-            ATy[j + 1] += xi[j] * yi;
+            ATA[(j + 1) * dim] += w * xi[j];
+            ATA[j + 1] += w * xi[j];
+            ATy[j + 1] += w * xi[j] * yi;
             for (int32_t k = j; k < p; k++) {
-                ATA[(j + 1) * dim + (k + 1)] += xi[j] * xi[k];
-                if (k != j) ATA[(k + 1) * dim + (j + 1)] += xi[j] * xi[k];
+                ATA[(j + 1) * dim + (k + 1)] += w * xi[j] * xi[k];
+                if (k != j) ATA[(k + 1) * dim + (j + 1)] += w * xi[j] * xi[k];
             }
         }
     }
@@ -834,21 +1332,26 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
 
     tree->nodes[node_idx].n_samples = n;
 
-    /* Compute parent impurity */
+    /* Compute parent impurity and total weight */
     double parent_impurity;
+    const double *sw = ctx->sample_weight;
+    double w_node = 0.0;
     if (ctx->task == 0) {
         double *counts = ctx->cls_counts_l;
         memset(counts, 0, (size_t)ctx->n_classes * sizeof(double));
         for (int32_t i = 0; i < n; i++) {
-            counts[(int32_t)ctx->y[sample_indices[i]]]++;
+            double w = sw_get(sw, sample_indices[i]);
+            counts[(int32_t)ctx->y[sample_indices[i]]] += w;
+            w_node += w;
         }
         if (ctx->criterion == 2) {
-            parent_impurity = gini_impurity(counts, ctx->n_classes, n);
+            parent_impurity = gini_impurity(counts, ctx->n_classes, w_node);
         } else {
-            parent_impurity = cls_impurity(counts, ctx->n_classes, n, ctx->criterion);
+            parent_impurity = cls_impurity(counts, ctx->n_classes, w_node, ctx->criterion);
         }
     } else {
-        parent_impurity = reg_impurity(ctx->y, sample_indices, n, ctx->criterion);
+        parent_impurity = reg_impurity(ctx->y, sample_indices, n, ctx->criterion, sw);
+        for (int32_t i = 0; i < n; i++) w_node += sw_get(sw, sample_indices[i]);
     }
     tree->nodes[node_idx].impurity = parent_impurity;
 
@@ -860,15 +1363,22 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
     if (ctx->max_leaf_nodes > 0 && tree->n_leaves >= ctx->max_leaf_nodes) make_leaf = 1;
 
     if (!make_leaf) {
-        split_result_t split = find_best_split(ctx, tree, sample_indices, n,
-                                                parent_impurity, depth,
-                                                lower_bound, upper_bound);
+        split_result_t split;
+        if (ctx->bins && !ctx->extra_trees) {
+            split = find_best_split_hist(ctx, sample_indices, n,
+                                          parent_impurity, depth,
+                                          lower_bound, upper_bound);
+        } else {
+            split = find_best_split(ctx, tree, sample_indices, n,
+                                     parent_impurity, depth,
+                                     lower_bound, upper_bound);
+        }
 
         if (split.feature < 0 || split.gain <= 0.0) {
             make_leaf = 1;
         } else {
-            /* Record importance */
-            ctx->importance[split.feature] += split.gain * n;
+            /* Record importance (weighted) */
+            ctx->importance[split.feature] += split.gain * w_node;
 
             /* HRF: record depth usage */
             if (ctx->heterogeneous && ctx->depth_usage) {
@@ -919,24 +1429,37 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
                     int32_t cst = ctx->monotonic_cst[feat];
                     if (cst != 0) {
                         /* Compute child prediction values for bounding.
-                         * Regression: mean of y. Classification (binary): P(class=1). */
+                         * Regression: weighted mean of y. Classification (binary): weighted P(class=1). */
                         double pred_l, pred_r;
                         if (ctx->task == 0 && ctx->n_classes == 2) {
-                            double cnt1_l = 0, cnt1_r = 0;
-                            for (int32_t i = 0; i < n_left; i++)
-                                cnt1_l += (ctx->y[sample_indices[i]] == 1.0);
-                            for (int32_t i = n_left; i < n; i++)
-                                cnt1_r += (ctx->y[sample_indices[i]] == 1.0);
-                            pred_l = cnt1_l / n_left;
-                            pred_r = cnt1_r / n_right;
+                            double wcnt1_l = 0, wcnt1_r = 0;
+                            double wl = 0, wr = 0;
+                            for (int32_t i = 0; i < n_left; i++) {
+                                double w = sw_get(sw, sample_indices[i]);
+                                wcnt1_l += w * (ctx->y[sample_indices[i]] == 1.0);
+                                wl += w;
+                            }
+                            for (int32_t i = n_left; i < n; i++) {
+                                double w = sw_get(sw, sample_indices[i]);
+                                wcnt1_r += w * (ctx->y[sample_indices[i]] == 1.0);
+                                wr += w;
+                            }
+                            pred_l = wl > 0 ? wcnt1_l / wl : 0;
+                            pred_r = wr > 0 ? wcnt1_r / wr : 0;
                         } else {
-                            double sum_l = 0, sum_r = 0;
-                            for (int32_t i = 0; i < n_left; i++)
-                                sum_l += ctx->y[sample_indices[i]];
-                            for (int32_t i = n_left; i < n; i++)
-                                sum_r += ctx->y[sample_indices[i]];
-                            pred_l = sum_l / n_left;
-                            pred_r = sum_r / n_right;
+                            double wsum_l = 0, wsum_r = 0, wl = 0, wr = 0;
+                            for (int32_t i = 0; i < n_left; i++) {
+                                double w = sw_get(sw, sample_indices[i]);
+                                wsum_l += w * ctx->y[sample_indices[i]];
+                                wl += w;
+                            }
+                            for (int32_t i = n_left; i < n; i++) {
+                                double w = sw_get(sw, sample_indices[i]);
+                                wsum_r += w * ctx->y[sample_indices[i]];
+                                wr += w;
+                            }
+                            pred_l = wl > 0 ? wsum_l / wl : 0;
+                            pred_r = wr > 0 ? wsum_r / wr : 0;
                         }
                         double mid = (pred_l + pred_r) * 0.5;
                         if (cst > 0) {
@@ -976,17 +1499,20 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
         double *leaf = tree->leaf_data + leaf_idx;
         memset(leaf, 0, (size_t)ctx->n_classes * sizeof(double));
         for (int32_t i = 0; i < n; i++) {
-            leaf[(int32_t)ctx->y[sample_indices[i]]]++;
+            double w = sw_get(sw, sample_indices[i]);
+            leaf[(int32_t)ctx->y[sample_indices[i]]] += w;
         }
         /* Clip class probabilities to monotonic bounds (binary classification).
          * Bounds are in [0,1] probability space for class 1. */
         if (ctx->monotonic_cst && ctx->n_classes == 2 && n > 0) {
             double total = leaf[0] + leaf[1];
-            double p1 = leaf[1] / total;
-            if (p1 < lower_bound) p1 = lower_bound;
-            if (p1 > upper_bound) p1 = upper_bound;
-            leaf[1] = p1 * total;
-            leaf[0] = (1.0 - p1) * total;
+            if (total > 0) {
+                double p1 = leaf[1] / total;
+                if (p1 < lower_bound) p1 = lower_bound;
+                if (p1 > upper_bound) p1 = upper_bound;
+                leaf[1] = p1 * total;
+                leaf[0] = (1.0 - p1) * total;
+            }
         }
     } else if (ctx->leaf_model == 1) {
         int32_t lm_size = ctx->ncol + 1;
@@ -999,9 +1525,13 @@ static int32_t build_node(build_ctx_t *ctx, rf_tree_t *tree,
         if (leaf_idx < 0) return -1;
         tree->nodes[node_idx].leaf_idx = leaf_idx;
 
-        double mean = 0.0;
-        for (int32_t i = 0; i < n; i++) mean += ctx->y[sample_indices[i]];
-        double pred = mean / n;
+        double wsum = 0.0, wsum_y = 0.0;
+        for (int32_t i = 0; i < n; i++) {
+            double w = sw_get(sw, sample_indices[i]);
+            wsum += w;
+            wsum_y += w * ctx->y[sample_indices[i]];
+        }
+        double pred = wsum > 0 ? wsum_y / wsum : 0.0;
         /* Clip to monotonic bounds */
         if (pred < lower_bound) pred = lower_bound;
         if (pred > upper_bound) pred = upper_bound;
@@ -1165,6 +1695,170 @@ static const double *predict_tree_cls(const rf_tree_t *tree, const double *x, in
     return tree->leaf_data + tree->nodes[idx].leaf_idx;
 }
 
+/* ---------- JARF rotation ---------- */
+
+/* Jacobi eigendecomposition of symmetric matrix A (n x n).
+ * On exit, A contains eigenvalues on diagonal, V contains eigenvectors (columns).
+ * Both A and V are n x n, row-major. */
+static void jacobi_eigen(double *A, double *V, int32_t n, int32_t max_iter) {
+    /* Initialize V to identity */
+    memset(V, 0, (size_t)n * n * sizeof(double));
+    for (int32_t i = 0; i < n; i++) V[(size_t)i * n + i] = 1.0;
+
+    for (int32_t iter = 0; iter < max_iter; iter++) {
+        /* Find largest off-diagonal element */
+        double max_off = 0;
+        int32_t p = 0, q = 1;
+        for (int32_t i = 0; i < n; i++) {
+            for (int32_t j = i + 1; j < n; j++) {
+                double a = fabs(A[(size_t)i * n + j]);
+                if (a > max_off) { max_off = a; p = i; q = j; }
+            }
+        }
+        if (max_off < 1e-12) break;
+
+        /* Compute rotation angle */
+        double app = A[(size_t)p * n + p];
+        double aqq = A[(size_t)q * n + q];
+        double apq = A[(size_t)p * n + q];
+        double theta;
+        if (fabs(app - aqq) < 1e-15) {
+            theta = M_PI / 4.0;
+        } else {
+            theta = 0.5 * atan2(2.0 * apq, app - aqq);
+        }
+        double c = cos(theta), s = sin(theta);
+
+        /* Apply rotation to A: A' = G^T * A * G */
+        for (int32_t i = 0; i < n; i++) {
+            if (i == p || i == q) continue;
+            double aip = A[(size_t)i * n + p];
+            double aiq = A[(size_t)i * n + q];
+            A[(size_t)i * n + p] = c * aip + s * aiq;
+            A[(size_t)p * n + i] = c * aip + s * aiq;
+            A[(size_t)i * n + q] = -s * aip + c * aiq;
+            A[(size_t)q * n + i] = -s * aip + c * aiq;
+        }
+        double new_pp = c * c * app + 2 * s * c * apq + s * s * aqq;
+        double new_qq = s * s * app - 2 * s * c * apq + c * c * aqq;
+        A[(size_t)p * n + p] = new_pp;
+        A[(size_t)q * n + q] = new_qq;
+        A[(size_t)p * n + q] = 0;
+        A[(size_t)q * n + p] = 0;
+
+        /* Update eigenvectors */
+        for (int32_t i = 0; i < n; i++) {
+            double vip = V[(size_t)i * n + p];
+            double viq = V[(size_t)i * n + q];
+            V[(size_t)i * n + p] = c * vip + s * viq;
+            V[(size_t)i * n + q] = -s * vip + c * viq;
+        }
+    }
+}
+
+/* Compute JARF rotation matrix.
+ * Returns malloc'd ncol*ncol rotation matrix (row-major), or NULL on failure. */
+static double *jarf_compute_rotation(
+    const double *X, int32_t nrow, int32_t ncol, const double *y,
+    int32_t task, int32_t n_estimators, int32_t max_depth, uint32_t seed)
+{
+    /* Step 1: Train surrogate RF */
+    rf_params_t surr_params;
+    rf_params_init(&surr_params);
+    surr_params.n_estimators = n_estimators;
+    surr_params.max_depth = max_depth;
+    surr_params.seed = seed;
+    surr_params.task = task;
+    surr_params.compute_oob = 0;
+    surr_params.jarf = 0;  /* no recursion */
+
+    rf_forest_t *surr = rf_fit(X, nrow, ncol, y, &surr_params);
+    if (!surr) return NULL;
+
+    /* Step 2: Finite-difference Jacobian
+     * J[i][j] = (f(x_i + eps*e_j) - f(x_i - eps*e_j)) / (2*eps) */
+    double eps = 1e-4;
+    size_t jac_size = (size_t)nrow * ncol;
+    double *J = (double *)calloc(jac_size, sizeof(double));
+    double *x_pert = (double *)malloc((size_t)ncol * sizeof(double));
+    if (!J || !x_pert) {
+        free(J); free(x_pert); rf_free(surr);
+        return NULL;
+    }
+
+    /* Batch prediction for efficiency: predict all rows with +eps and -eps for each feature */
+    double *X_plus = (double *)malloc((size_t)nrow * ncol * sizeof(double));
+    double *X_minus = (double *)malloc((size_t)nrow * ncol * sizeof(double));
+    double *pred_plus = (double *)malloc((size_t)nrow * sizeof(double));
+    double *pred_minus = (double *)malloc((size_t)nrow * sizeof(double));
+    if (!X_plus || !X_minus || !pred_plus || !pred_minus) {
+        free(J); free(x_pert); free(X_plus); free(X_minus);
+        free(pred_plus); free(pred_minus); rf_free(surr);
+        return NULL;
+    }
+
+    for (int32_t j = 0; j < ncol; j++) {
+        memcpy(X_plus, X, (size_t)nrow * ncol * sizeof(double));
+        memcpy(X_minus, X, (size_t)nrow * ncol * sizeof(double));
+        for (int32_t i = 0; i < nrow; i++) {
+            X_plus[(size_t)i * ncol + j] += eps;
+            X_minus[(size_t)i * ncol + j] -= eps;
+        }
+        rf_predict(surr, X_plus, nrow, ncol, pred_plus);
+        rf_predict(surr, X_minus, nrow, ncol, pred_minus);
+        for (int32_t i = 0; i < nrow; i++) {
+            J[(size_t)i * ncol + j] = (pred_plus[i] - pred_minus[i]) / (2.0 * eps);
+        }
+    }
+
+    free(X_plus); free(X_minus); free(pred_plus); free(pred_minus); free(x_pert);
+    rf_free(surr);
+
+    /* Step 3: EJOP = J^T * J / n (ncol x ncol symmetric matrix) */
+    size_t mat_size = (size_t)ncol * ncol;
+    double *EJOP = (double *)calloc(mat_size, sizeof(double));
+    if (!EJOP) { free(J); return NULL; }
+
+    for (int32_t i = 0; i < ncol; i++) {
+        for (int32_t j = i; j < ncol; j++) {
+            double sum = 0;
+            for (int32_t k = 0; k < nrow; k++) {
+                sum += J[(size_t)k * ncol + i] * J[(size_t)k * ncol + j];
+            }
+            EJOP[(size_t)i * ncol + j] = sum / nrow;
+            EJOP[(size_t)j * ncol + i] = sum / nrow;
+        }
+    }
+    free(J);
+
+    /* Step 4: Eigendecompose EJOP via Jacobi iteration */
+    double *V = (double *)malloc(mat_size * sizeof(double));
+    if (!V) { free(EJOP); return NULL; }
+
+    jacobi_eigen(EJOP, V, ncol, 100);
+    free(EJOP);
+
+    /* V contains eigenvectors as columns -- this IS the rotation matrix */
+    return V;
+}
+
+/* Apply rotation: X_rotated = X * R (nrow x ncol times ncol x ncol) */
+static double *jarf_rotate_data(const double *X, int32_t nrow, int32_t ncol,
+                                 const double *R) {
+    double *X_rot = (double *)malloc((size_t)nrow * ncol * sizeof(double));
+    if (!X_rot) return NULL;
+    for (int32_t i = 0; i < nrow; i++) {
+        for (int32_t j = 0; j < ncol; j++) {
+            double sum = 0;
+            for (int32_t k = 0; k < ncol; k++) {
+                sum += X[(size_t)i * ncol + k] * R[(size_t)k * ncol + j];
+            }
+            X_rot[(size_t)i * ncol + j] = sum;
+        }
+    }
+    return X_rot;
+}
+
 /* ---------- rf_fit ---------- */
 
 rf_forest_t *rf_fit(
@@ -1188,6 +1882,26 @@ rf_forest_t *rf_fit(
             if (c + 1 > n_classes) n_classes = c + 1;
         }
         if (n_classes < 2) { set_error("rf_fit: need at least 2 classes"); return NULL; }
+    }
+
+    /* JARF: compute rotation and transform X */
+    double *jarf_rotation = NULL;
+    double *X_rotated = NULL;
+    if (params->jarf && ncol > 1) {
+        jarf_rotation = jarf_compute_rotation(
+            X, nrow, ncol, y, params->task,
+            params->jarf_n_estimators > 0 ? params->jarf_n_estimators : 50,
+            params->jarf_max_depth > 0 ? params->jarf_max_depth : 6,
+            params->seed);
+        if (jarf_rotation) {
+            X_rotated = jarf_rotate_data(X, nrow, ncol, jarf_rotation);
+            if (X_rotated) {
+                X = X_rotated;  /* use rotated data for fitting */
+            } else {
+                free(jarf_rotation);
+                jarf_rotation = NULL;
+            }
+        }
     }
 
     /* Resolve max_features */
@@ -1233,6 +1947,12 @@ rf_forest_t *rf_fit(
     forest->n_train = 0;
     forest->y_train = NULL;
     forest->y_train_copy = NULL;
+
+    /* Validate and store sample weights */
+    const double *sample_weight = NULL;
+    if (params->sample_weight && params->n_sample_weight == nrow) {
+        sample_weight = params->sample_weight;
+    }
 
     /* Copy monotonic constraints if provided */
     if (params->monotonic_cst && params->n_monotonic_cst == ncol) {
@@ -1309,6 +2029,27 @@ rf_forest_t *rf_fit(
         cls_counts_r = (double *)malloc((size_t)n_classes * sizeof(double));
     }
 
+    /* Histogram binning: create bins if enabled and not ExtraTrees */
+    rf_bins_t *hist_bins = NULL;
+    double *hist_cls = NULL, *hist_wsum = NULL, *hist_wy = NULL, *hist_wy2 = NULL;
+    int32_t *hist_cnt = NULL;
+    int32_t hist_max_bins = params->max_bins;
+    if (hist_max_bins < 2) hist_max_bins = 2;
+    if (hist_max_bins > 256) hist_max_bins = 256;
+    if (params->histogram && !params->extra_trees) {
+        hist_bins = rf_bins_create(X, nrow, ncol, hist_max_bins);
+        if (hist_bins) {
+            int32_t mb = hist_bins->max_bins;
+            hist_wsum = (double *)calloc((size_t)mb, sizeof(double));
+            hist_wy = (double *)calloc((size_t)mb, sizeof(double));
+            hist_wy2 = (double *)calloc((size_t)mb, sizeof(double));
+            hist_cnt = (int32_t *)calloc((size_t)mb, sizeof(int32_t));
+            if (params->task == 0) {
+                hist_cls = (double *)calloc((size_t)mb * n_classes, sizeof(double));
+            }
+        }
+    }
+
     if (!boot_indices || !boot_counts || !feature_buf || !val_buf || !idx_buf || !nan_indices || !importance) {
         set_error("rf_fit: scratch allocation failed");
         free(boot_indices); free(boot_counts); free(feature_buf);
@@ -1317,6 +2058,8 @@ rf_forest_t *rf_fit(
         free(oob_pred); free(oob_count);
         free(tree_oob_pred); free(tree_oob_count);
         free(cls_counts_l); free(cls_counts_r);
+        rf_bins_free(hist_bins);
+        free(hist_cls); free(hist_wsum); free(hist_wy); free(hist_wy2); free(hist_cnt);
         rf_free(forest);
         return NULL;
     }
@@ -1333,6 +2076,8 @@ rf_forest_t *rf_fit(
             free(oob_pred); free(oob_count);
             free(tree_oob_pred); free(tree_oob_count);
             free(cls_counts_l); free(cls_counts_r);
+            rf_bins_free(hist_bins);
+            free(hist_cls); free(hist_wsum); free(hist_wy); free(hist_wy2); free(hist_cnt);
             rf_free(forest);
             return NULL;
         }
@@ -1379,7 +2124,14 @@ rf_forest_t *rf_fit(
             .cls_counts_l = cls_counts_l,
             .cls_counts_r = cls_counts_r,
             .sample_indices_buf = NULL,
-            .nan_indices = nan_indices
+            .nan_indices = nan_indices,
+            .sample_weight = sample_weight,
+            .bins = hist_bins,
+            .hist_cls = hist_cls,
+            .hist_wsum = hist_wsum,
+            .hist_wy = hist_wy,
+            .hist_wy2 = hist_wy2,
+            .hist_cnt = hist_cnt
         };
 
         int32_t root = build_node(&ctx, &forest->trees[t], boot_indices, n_samples, 0,
@@ -1392,6 +2144,8 @@ rf_forest_t *rf_fit(
             free(oob_pred); free(oob_count);
             free(tree_oob_pred); free(tree_oob_count);
             free(cls_counts_l); free(cls_counts_r);
+            rf_bins_free(hist_bins);
+            free(hist_cls); free(hist_wsum); free(hist_wy); free(hist_wy2); free(hist_cnt);
             rf_free(forest);
             return NULL;
         }
@@ -1618,6 +2372,14 @@ rf_forest_t *rf_fit(
         }
     }
 
+    /* Store sample weights for weighted quantile prediction */
+    if (params->store_leaf_samples && sample_weight) {
+        forest->sample_weight_copy = (double *)malloc((size_t)nrow * sizeof(double));
+        if (forest->sample_weight_copy) {
+            memcpy(forest->sample_weight_copy, sample_weight, (size_t)nrow * sizeof(double));
+        }
+    }
+
     /* Cleanup scratch */
     free(boot_indices);
     free(boot_counts);
@@ -1634,6 +2396,17 @@ rf_forest_t *rf_fit(
     free(tree_oob_count);
     free(cls_counts_l);
     free(cls_counts_r);
+    rf_bins_free(hist_bins);
+    free(hist_cls);
+    free(hist_wsum);
+    free(hist_wy);
+    free(hist_wy2);
+    free(hist_cnt);
+
+    /* Store JARF rotation in forest */
+    forest->jarf_rotation = jarf_rotation;
+    forest->jarf_ncol = jarf_rotation ? ncol : 0;
+    free(X_rotated);
 
     return forest;
 }
@@ -1654,10 +2427,17 @@ int rf_predict(
         return -1;
     }
 
+    /* JARF: rotate input if rotation exists */
+    double *X_rot = NULL;
+    if (forest->jarf_rotation && forest->jarf_ncol == ncol) {
+        X_rot = jarf_rotate_data(X, nrow, ncol, forest->jarf_rotation);
+        if (X_rot) X = X_rot;
+    }
+
     if (forest->task == 0) {
         /* Classification: majority vote (optionally weighted) */
         double *vote_buf = (double *)calloc((size_t)forest->n_classes, sizeof(double));
-        if (!vote_buf) { set_error("rf_predict: allocation failed"); return -1; }
+        if (!vote_buf) { free(X_rot); set_error("rf_predict: allocation failed"); return -1; }
 
         for (int32_t i = 0; i < nrow; i++) {
             const double *row = X + (size_t)i * ncol;
@@ -1696,6 +2476,7 @@ int rf_predict(
         }
     }
 
+    free(X_rot);
     return 0;
 }
 
@@ -1717,6 +2498,13 @@ int rf_predict_proba(
     if (ncol != forest->n_features) {
         set_error("rf_predict_proba: n_features mismatch");
         return -1;
+    }
+
+    /* JARF: rotate input if rotation exists */
+    double *X_rot = NULL;
+    if (forest->jarf_rotation && forest->jarf_ncol == ncol) {
+        X_rot = jarf_rotate_data(X, nrow, ncol, forest->jarf_rotation);
+        if (X_rot) X = X_rot;
     }
 
     int32_t nc = forest->n_classes;
@@ -1746,17 +2534,11 @@ int rf_predict_proba(
         }
     }
 
+    free(X_rot);
     return 0;
 }
 
 /* ---------- rf_predict_quantile ---------- */
-
-static int cmp_double(const void *a, const void *b) {
-    double da = *(const double *)a, db = *(const double *)b;
-    if (da < db) return -1;
-    if (da > db) return 1;
-    return 0;
-}
 
 int rf_predict_quantile(
     const rf_forest_t *forest,
@@ -1781,13 +2563,24 @@ int rf_predict_quantile(
         return -1;
     }
 
+    /* JARF: rotate input if rotation exists */
+    double *X_rot = NULL;
+    if (forest->jarf_rotation && forest->jarf_ncol == ncol) {
+        X_rot = jarf_rotate_data(X, nrow, ncol, forest->jarf_rotation);
+        if (X_rot) X = X_rot;
+    }
+
     /* For each test sample: collect all co-leaf training y-values across trees,
      * sort, compute requested quantiles. */
-    /* Allocate buffer for collecting y-values: worst case n_train * n_trees,
-     * but typically much smaller. Use dynamic resizing. */
     int32_t buf_cap = forest->n_train;
     double *y_buf = (double *)malloc((size_t)buf_cap * sizeof(double));
-    if (!y_buf) { set_error("rf_predict_quantile: allocation failed"); return -1; }
+    double *w_buf = NULL;
+    const double *swc = forest->sample_weight_copy;
+    if (swc) {
+        w_buf = (double *)malloc((size_t)buf_cap * sizeof(double));
+        if (!w_buf) { free(y_buf); free(X_rot); set_error("rf_predict_quantile: allocation failed"); return -1; }
+    }
+    if (!y_buf) { free(X_rot); set_error("rf_predict_quantile: allocation failed"); return -1; }
 
     for (int32_t i = 0; i < nrow; i++) {
         const double *row = X + (size_t)i * ncol;
@@ -1807,12 +2600,20 @@ int rf_predict_quantile(
             if (n_collected + n_add > buf_cap) {
                 while (buf_cap < n_collected + n_add) buf_cap *= 2;
                 double *tmp = (double *)realloc(y_buf, (size_t)buf_cap * sizeof(double));
-                if (!tmp) { free(y_buf); set_error("rf_predict_quantile: allocation failed"); return -1; }
+                if (!tmp) { free(y_buf); free(w_buf); free(X_rot); set_error("rf_predict_quantile: allocation failed"); return -1; }
                 y_buf = tmp;
+                if (swc) {
+                    tmp = (double *)realloc(w_buf, (size_t)buf_cap * sizeof(double));
+                    if (!tmp) { free(y_buf); free(w_buf); free(X_rot); set_error("rf_predict_quantile: allocation failed"); return -1; }
+                    w_buf = tmp;
+                }
             }
 
             for (int32_t j = start; j < end; j++) {
-                y_buf[n_collected++] = forest->y_train_copy[tr->leaf_samples[j]];
+                int32_t si = tr->leaf_samples[j];
+                y_buf[n_collected] = forest->y_train_copy[si];
+                if (swc) w_buf[n_collected] = swc[si];
+                n_collected++;
             }
         }
 
@@ -1823,31 +2624,74 @@ int rf_predict_quantile(
             continue;
         }
 
-        /* Sort collected y-values */
-        qsort(y_buf, (size_t)n_collected, sizeof(double), cmp_double);
+        /* Sort collected y-values (co-sort weights if present) */
+        /* Use index sort to preserve y-w pairing */
+        int32_t *sort_idx = (int32_t *)malloc((size_t)n_collected * sizeof(int32_t));
+        if (!sort_idx) { free(y_buf); free(w_buf); free(X_rot); set_error("rf_predict_quantile: allocation failed"); return -1; }
+        for (int32_t j = 0; j < n_collected; j++) sort_idx[j] = j;
+        g_sort_ctx.vals = y_buf;
+        qsort(sort_idx, (size_t)n_collected, sizeof(int32_t), cmp_by_val);
 
-        /* Compute each quantile using linear interpolation */
-        for (int32_t q = 0; q < n_quantiles; q++) {
-            double p = quantiles[q];
-            if (p <= 0.0) {
-                out[(size_t)i * n_quantiles + q] = y_buf[0];
-            } else if (p >= 1.0) {
-                out[(size_t)i * n_quantiles + q] = y_buf[n_collected - 1];
-            } else {
-                double idx_f = p * (n_collected - 1);
-                int32_t lo = (int32_t)idx_f;
-                double frac = idx_f - lo;
-                if (lo >= n_collected - 1) {
-                    out[(size_t)i * n_quantiles + q] = y_buf[n_collected - 1];
+        /* Compute each quantile */
+        if (swc) {
+            /* Weighted quantile: build cumulative weight CDF */
+            double w_total = 0;
+            for (int32_t j = 0; j < n_collected; j++) w_total += w_buf[sort_idx[j]];
+
+            for (int32_t q = 0; q < n_quantiles; q++) {
+                double p = quantiles[q];
+                if (p <= 0.0) {
+                    out[(size_t)i * n_quantiles + q] = y_buf[sort_idx[0]];
+                } else if (p >= 1.0) {
+                    out[(size_t)i * n_quantiles + q] = y_buf[sort_idx[n_collected - 1]];
                 } else {
-                    out[(size_t)i * n_quantiles + q] =
-                        y_buf[lo] * (1.0 - frac) + y_buf[lo + 1] * frac;
+                    double target = p * w_total;
+                    double cum = 0;
+                    int32_t j;
+                    for (j = 0; j < n_collected - 1; j++) {
+                        cum += w_buf[sort_idx[j]];
+                        if (cum >= target) break;
+                    }
+                    /* Linear interpolation between j and j+1 */
+                    if (j >= n_collected - 1) {
+                        out[(size_t)i * n_quantiles + q] = y_buf[sort_idx[n_collected - 1]];
+                    } else {
+                        double w_prev = cum - w_buf[sort_idx[j]];
+                        double frac = (target - w_prev) / w_buf[sort_idx[j]];
+                        if (frac < 0) frac = 0;
+                        if (frac > 1) frac = 1;
+                        out[(size_t)i * n_quantiles + q] =
+                            y_buf[sort_idx[j]] * (1.0 - frac) + y_buf[sort_idx[j < n_collected - 1 ? j + 1 : j]] * frac;
+                    }
+                }
+            }
+        } else {
+            /* Unweighted quantile: linear interpolation */
+            for (int32_t q = 0; q < n_quantiles; q++) {
+                double p = quantiles[q];
+                if (p <= 0.0) {
+                    out[(size_t)i * n_quantiles + q] = y_buf[sort_idx[0]];
+                } else if (p >= 1.0) {
+                    out[(size_t)i * n_quantiles + q] = y_buf[sort_idx[n_collected - 1]];
+                } else {
+                    double idx_f = p * (n_collected - 1);
+                    int32_t lo = (int32_t)idx_f;
+                    double frac = idx_f - lo;
+                    if (lo >= n_collected - 1) {
+                        out[(size_t)i * n_quantiles + q] = y_buf[sort_idx[n_collected - 1]];
+                    } else {
+                        out[(size_t)i * n_quantiles + q] =
+                            y_buf[sort_idx[lo]] * (1.0 - frac) + y_buf[sort_idx[lo + 1]] * frac;
+                    }
                 }
             }
         }
+        free(sort_idx);
     }
 
     free(y_buf);
+    free(w_buf);
+    free(X_rot);
     return 0;
 }
 
@@ -1928,12 +2772,78 @@ int rf_predict_interval(
     return 0;
 }
 
+/* ---------- rf_proximity ---------- */
+
+int rf_proximity(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    double *out
+) {
+    if (!forest || !X || !out || nrow <= 0) {
+        set_error("rf_proximity: invalid input");
+        return -1;
+    }
+    if (ncol != forest->n_features) {
+        set_error("rf_proximity: n_features mismatch");
+        return -1;
+    }
+
+    /* JARF: rotate input if rotation exists */
+    double *X_rot = NULL;
+    if (forest->jarf_rotation && forest->jarf_ncol == ncol) {
+        X_rot = jarf_rotate_data(X, nrow, ncol, forest->jarf_rotation);
+        if (X_rot) X = X_rot;
+    }
+
+    /* Initialize output to zero */
+    memset(out, 0, (size_t)nrow * nrow * sizeof(double));
+
+    /* Per-tree leaf indices buffer */
+    int32_t *leaf_ids = (int32_t *)malloc((size_t)nrow * sizeof(int32_t));
+    if (!leaf_ids) {
+        free(X_rot);
+        set_error("rf_proximity: allocation failed");
+        return -1;
+    }
+
+    for (int32_t t = 0; t < forest->n_trees; t++) {
+        const rf_tree_t *tr = &forest->trees[t];
+
+        /* Compute leaf index for each sample */
+        for (int32_t i = 0; i < nrow; i++) {
+            const double *row = X + (size_t)i * ncol;
+            leaf_ids[i] = tree_leaf_idx(tr, row);
+        }
+
+        /* Count co-leaf pairs */
+        for (int32_t i = 0; i < nrow; i++) {
+            for (int32_t j = i; j < nrow; j++) {
+                if (leaf_ids[i] == leaf_ids[j]) {
+                    out[(size_t)i * nrow + j] += 1.0;
+                    if (i != j) out[(size_t)j * nrow + i] += 1.0;
+                }
+            }
+        }
+    }
+
+    /* Normalize by number of trees */
+    double inv_trees = 1.0 / forest->n_trees;
+    for (size_t k = 0; k < (size_t)nrow * nrow; k++) {
+        out[k] *= inv_trees;
+    }
+
+    free(leaf_ids);
+    free(X_rot);
+    return 0;
+}
+
 /* ---------- serialization (RF01) ---------- */
 
 static const char RF01_MAGIC[4] = {'R', 'F', '0', '1'};
 #define RF01_HEADER_SIZE 56
 #define RF02_HEADER_SIZE 72
 #define RF03_HEADER_SIZE 72  /* same header size as v2; nan_dir stored per-node */
+#define RF04_HEADER_SIZE 80  /* v4: +8 bytes for histogram/jarf/max_bins/jarf_ncol */
 
 int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
     if (!f || !out_buf || !out_len) {
@@ -1941,13 +2851,18 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
         return -1;
     }
 
-    /* Always write format version 3 (adds nan_dir per node) */
-    size_t size = RF03_HEADER_SIZE;
+    /* Always write format version 4 (adds histogram/jarf metadata) */
+    size_t size = RF04_HEADER_SIZE;
     /* tree_weights if oob_weighting */
     if (f->tree_weights) {
         size += (size_t)f->n_trees * 8;
     }
     size += (size_t)f->n_features * 8;  /* feature importances */
+
+    /* JARF rotation matrix (ncol * ncol doubles) */
+    if (f->jarf_rotation && f->jarf_ncol > 0) {
+        size += (size_t)f->jarf_ncol * f->jarf_ncol * 8;
+    }
 
     for (int32_t t = 0; t < f->n_trees; t++) {
         size += 8;  /* tree header: n_nodes + n_leaves */
@@ -1959,10 +2874,10 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
     if (!buf) { set_error("rf_save: allocation failed"); return -1; }
     char *p = buf;
 
-    /* Header (72 bytes, same layout as v2) */
+    /* Header (80 bytes for v4) */
     memcpy(p, RF01_MAGIC, 4); p += 4;
     uint32_t v;
-    v = 3; memcpy(p, &v, 4); p += 4;  /* format version 3 */
+    v = 4; memcpy(p, &v, 4); p += 4;  /* format version 4 */
     v = (uint32_t)f->n_trees; memcpy(p, &v, 4); p += 4;
     v = (uint32_t)f->n_features; memcpy(p, &v, 4); p += 4;
     v = (uint32_t)f->n_classes; memcpy(p, &v, 4); p += 4;
@@ -1987,6 +2902,23 @@ int rf_save(const rf_forest_t *f, char **out_buf, int32_t *out_len) {
     /* v2 extension: sample_rate + alpha_trim */
     memcpy(p, &f->sample_rate, 8); p += 8;
     memcpy(p, &f->alpha_trim, 8); p += 8;
+
+    /* v4 extension: histogram + jarf metadata (8 bytes) */
+    {
+        uint8_t jarf_flag = (f->jarf_rotation && f->jarf_ncol > 0) ? 1 : 0;
+        *p++ = 0;             /* histogram (uint8, for metadata only) */
+        *p++ = jarf_flag;     /* jarf (uint8) */
+        p += 2;               /* reserved */
+        i32 = f->jarf_ncol;
+        memcpy(p, &i32, 4); p += 4;
+    }
+
+    /* JARF rotation matrix (if present) */
+    if (f->jarf_rotation && f->jarf_ncol > 0) {
+        size_t rot_bytes = (size_t)f->jarf_ncol * f->jarf_ncol * 8;
+        memcpy(p, f->jarf_rotation, rot_bytes);
+        p += rot_bytes;
+    }
 
     /* tree_weights (if oob_weighting) */
     if (f->tree_weights) {
@@ -2054,13 +2986,17 @@ rf_forest_t *rf_load(const char *buf, int32_t len) {
 
     uint32_t version;
     memcpy(&version, p, 4); p += 4;
-    if (version != 1 && version != 2 && version != 3) {
+    if (version < 1 || version > 4) {
         set_error("rf_load: unsupported version");
         return NULL;
     }
 
-    if (version >= 2 && len < RF02_HEADER_SIZE) {
+    if (version >= 2 && version <= 3 && len < RF02_HEADER_SIZE) {
         set_error("rf_load: buffer too short for v2/v3 header");
+        return NULL;
+    }
+    if (version >= 4 && len < RF04_HEADER_SIZE) {
+        set_error("rf_load: buffer too short for v4 header");
         return NULL;
     }
 
@@ -2107,6 +3043,26 @@ rf_forest_t *rf_load(const char *buf, int32_t len) {
     } else {
         f->sample_rate = 1.0;
         f->alpha_trim = 0.0;
+    }
+
+    /* v4 extension: histogram + jarf metadata */
+    f->jarf_rotation = NULL;
+    f->jarf_ncol = 0;
+    if (version >= 4) {
+        p++;  /* histogram (uint8, metadata only) */
+        uint8_t jarf_flag = (uint8_t)*p++;
+        p += 2;  /* reserved */
+        int32_t jarf_ncol;
+        memcpy(&jarf_ncol, p, 4); p += 4;
+        f->jarf_ncol = jarf_ncol;
+
+        if (jarf_flag && jarf_ncol > 0) {
+            size_t rot_bytes = (size_t)jarf_ncol * jarf_ncol * 8;
+            f->jarf_rotation = (double *)malloc(rot_bytes);
+            if (!f->jarf_rotation) { set_error("rf_load: allocation failed"); rf_free(f); return NULL; }
+            memcpy(f->jarf_rotation, p, rot_bytes);
+            p += rot_bytes;
+        }
     }
 
     /* tree_weights (v2 with oob_weighting) */
@@ -2180,8 +3136,89 @@ rf_forest_t *rf_load(const char *buf, int32_t len) {
     f->n_train = 0;
     f->y_train = NULL;
     f->y_train_copy = NULL;
+    f->sample_weight_copy = NULL;
 
     return f;
+}
+
+/* ---------- permutation importance ---------- */
+
+static double perm_imp_score(const rf_forest_t *f, const double *X,
+                              int32_t nrow, int32_t ncol, const double *y,
+                              double *pred_buf) {
+    rf_predict(f, X, nrow, ncol, pred_buf);
+    if (f->task == 1) {
+        /* R2 */
+        double ymean = 0;
+        for (int32_t i = 0; i < nrow; i++) ymean += y[i];
+        ymean /= nrow;
+        double ss_res = 0, ss_tot = 0;
+        for (int32_t i = 0; i < nrow; i++) {
+            double r = y[i] - pred_buf[i];
+            ss_res += r * r;
+            ss_tot += (y[i] - ymean) * (y[i] - ymean);
+        }
+        return ss_tot > 0 ? 1.0 - ss_res / ss_tot : 0.0;
+    } else {
+        /* Accuracy */
+        int32_t correct = 0;
+        for (int32_t i = 0; i < nrow; i++) {
+            if ((int32_t)pred_buf[i] == (int32_t)y[i]) correct++;
+        }
+        return (double)correct / nrow;
+    }
+}
+
+int rf_permutation_importance(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    const double *y, int32_t n_repeats, uint32_t seed,
+    double *out)
+{
+    if (!forest || !X || !y || !out) {
+        set_error("rf_permutation_importance: NULL argument");
+        return -1;
+    }
+    if (ncol != forest->n_features) {
+        set_error("rf_permutation_importance: ncol mismatch");
+        return -1;
+    }
+    if (n_repeats < 1) n_repeats = 1;
+
+    double *X_perm = (double *)malloc((size_t)nrow * ncol * sizeof(double));
+    double *pred_buf = (double *)malloc((size_t)nrow * sizeof(double));
+    if (!X_perm || !pred_buf) {
+        free(X_perm); free(pred_buf);
+        set_error("rf_permutation_importance: allocation failed");
+        return -1;
+    }
+
+    /* Baseline score */
+    double baseline = perm_imp_score(forest, X, nrow, ncol, y, pred_buf);
+
+    rf_rng_t rng = { seed };
+
+    for (int32_t j = 0; j < ncol; j++) {
+        double total_drop = 0;
+        for (int32_t rep = 0; rep < n_repeats; rep++) {
+            /* Copy X */
+            memcpy(X_perm, X, (size_t)nrow * ncol * sizeof(double));
+            /* Fisher-Yates shuffle column j */
+            for (int32_t i = nrow - 1; i > 0; i--) {
+                int32_t k = rf_rng_int(&rng, i + 1);
+                double tmp = X_perm[(size_t)i * ncol + j];
+                X_perm[(size_t)i * ncol + j] = X_perm[(size_t)k * ncol + j];
+                X_perm[(size_t)k * ncol + j] = tmp;
+            }
+            double perm_score = perm_imp_score(forest, X_perm, nrow, ncol, y, pred_buf);
+            total_drop += baseline - perm_score;
+        }
+        out[j] = total_drop / n_repeats;
+    }
+
+    free(X_perm);
+    free(pred_buf);
+    return 0;
 }
 
 /* ---------- free ---------- */
@@ -2200,6 +3237,8 @@ void rf_free(rf_forest_t *f) {
     free(f->oob_predictions);
     free(f->oob_counts);
     free(f->y_train_copy);
+    free(f->sample_weight_copy);
+    free(f->jarf_rotation);
     free(f);
 }
 

@@ -184,6 +184,29 @@ def _load_lib():
     ]
     _lib.rf_predict_interval.restype = ctypes.c_int
 
+    # rf_permutation_importance
+    _lib.rf_permutation_importance.argtypes = [
+        ctypes.c_void_p,   # forest
+        ctypes.c_void_p,   # X
+        ctypes.c_int32,    # nrow
+        ctypes.c_int32,    # ncol
+        ctypes.c_void_p,   # y
+        ctypes.c_int32,    # n_repeats
+        ctypes.c_uint32,   # seed
+        ctypes.c_void_p,   # out
+    ]
+    _lib.rf_permutation_importance.restype = ctypes.c_int
+
+    # rf_proximity
+    _lib.rf_proximity.argtypes = [
+        ctypes.c_void_p,   # forest
+        ctypes.c_void_p,   # X
+        ctypes.c_int32,    # nrow
+        ctypes.c_int32,    # ncol
+        ctypes.c_void_p,   # out
+    ]
+    _lib.rf_proximity.restype = ctypes.c_int
+
     return _lib
 
 
@@ -211,4 +234,11 @@ class RFParams(ctypes.Structure):
         ('alpha_trim', ctypes.c_double),
         ('monotonic_cst', ctypes.POINTER(ctypes.c_int32)),
         ('n_monotonic_cst', ctypes.c_int32),
+        ('sample_weight', ctypes.POINTER(ctypes.c_double)),
+        ('n_sample_weight', ctypes.c_int32),
+        ('histogram', ctypes.c_int32),
+        ('max_bins', ctypes.c_int32),
+        ('jarf', ctypes.c_int32),
+        ('jarf_n_estimators', ctypes.c_int32),
+        ('jarf_max_depth', ctypes.c_int32),
     ]

@@ -11,16 +11,20 @@ Part of [wlearn](https://wlearn.org) ([GitHub](https://github.com/wlearn-org), [
 - ExtraTrees mode (random threshold per feature)
 - Heterogeneous RF (depth-dependent feature weighting)
 - OOB scoring with optional per-tree weighting
-- MDI feature importances
+- MDI feature importances and permutation importance
 - Cost-complexity pruning
 - Local linear leaf models (regression)
 - Missing value handling (learned NaN direction per split)
 - Monotonic constraints (bound propagation)
 - Quantile regression forests (per-leaf sample storage)
 - Conformal prediction intervals (Jackknife+-after-Bootstrap)
+- Sample weights (per-sample, or `classWeight: 'balanced'`)
+- Histogram binning (5-50x speedup on large datasets)
+- JARF rotation (Jacobian Aligned Random Forests)
+- Proximity matrix (co-leaf fraction across trees)
 - Deterministic (LCG PRNG, fixed seed)
-- Binary serialization (RF01/RF02/RF03, save/load)
-- 85 C tests, 39 JS tests, 27 Python tests, 74 parity tests
+- Binary serialization (RF01-RF04, save/load, backward-compatible)
+- 137 C tests, 43 JS tests, 31 Python tests, 87 parity tests
 
 Default parameters match sklearn's `RandomForestClassifier` / `RandomForestRegressor` exactly.
 
@@ -177,6 +181,18 @@ All parameters have defaults that match sklearn. New features are opt-in and do 
 | Store leaf samples | `storeLeafSamples` | `store_leaf_samples` | `store_leaf_samples` | auto | Store per-leaf sample indices for quantile prediction. Auto-enabled for regression |
 | Monotonic constraints | `monotonicCst` | `monotonic_cst` | `monotonic_cst` | null | Per-feature constraints: -1 = decreasing, 0 = none, +1 = increasing. Array of length n_features |
 
+### v0.4 Parameters
+
+| Parameter | JS name | Python name | C field | Default | Description |
+|-----------|---------|-------------|---------|---------|-------------|
+| Sample weight | `sampleWeight` | `sample_weight` | `sample_weight` | null (uniform) | Per-sample weights for splits, leaves, bootstrap, and OOB |
+| Class weight | `classWeight` | `class_weight` | -- | null | `'balanced'` auto-computes `n / (K * n_k)` per class (JS/Python wrapper only) |
+| Histogram binning | `histogramBinning` | `histogram_binning` | `histogram` | 0 | Pre-bin features into up to 256 uint8 buckets. 1 = enabled |
+| Max bins | `maxBins` | `max_bins` | `max_bins` | 256 | Maximum number of histogram bins (2-256) |
+| JARF | `jarf` | `jarf` | `jarf` | 0 | Jacobian Aligned Random Forests. 1 = enabled |
+| JARF estimators | `jarfNEstimators` | `jarf_n_estimators` | `jarf_n_estimators` | 50 | Number of trees in JARF surrogate forest |
+| JARF max depth | `jarfMaxDepth` | `jarf_max_depth` | `jarf_max_depth` | 6 | Max depth of JARF surrogate trees |
+
 ### Methods
 
 #### JavaScript (`RFModel`)
@@ -202,7 +218,9 @@ model.predictInterval(X, alpha)  // Returns { lower: Float64Array, upper: Float6
 
 // Inspection
 model.featureImportances()     // Returns Float64Array (normalized MDI)
+model.permutationImportance(X, y, { nRepeats: 5, seed: 42 })  // Model-agnostic importance
 model.oobScore()               // OOB accuracy (cls) or R2 (reg)
+model.proximity(X)             // Returns Float64Array (nrow*nrow, symmetric)
 model.nFeatures                // Number of features
 model.nClasses                 // Number of classes (0 for regression)
 model.nTrees                   // Number of trees
@@ -246,7 +264,9 @@ lower, upper = model.predict_interval(X, alpha=0.1)  # Returns (lower, upper) ar
 
 # Inspection
 model.feature_importances()    # Returns numpy array
+model.permutation_importance(X, y, n_repeats=5, seed=42)  # Model-agnostic importance
 model.oob_score()              # OOB score
+model.proximity(X)             # Returns (nrow, nrow) numpy array
 model.n_features               # Number of features
 model.n_classes                # Number of classes
 model.n_trees                  # Number of trees
@@ -290,6 +310,17 @@ int rf_predict_quantile(const rf_forest_t *forest, const double *X,
 int rf_predict_interval(const rf_forest_t *forest, const double *X,
                         int32_t nrow, int32_t ncol, double alpha,
                         double *out_lower, double *out_upper);
+
+// Permutation importance (model-agnostic).
+// out: ncol doubles, mean score drop per feature.
+int rf_permutation_importance(const rf_forest_t *forest,
+                              const double *X, int32_t nrow, int32_t ncol,
+                              const double *y, int32_t n_repeats,
+                              uint32_t seed, double *out);
+
+// Proximity matrix. out: nrow * nrow doubles, row-major, symmetric.
+int rf_proximity(const rf_forest_t *forest, const double *X,
+                 int32_t nrow, int32_t ncol, double *out);
 
 // Serialize / deserialize
 int rf_save(const rf_forest_t *forest, char **out_buf, int32_t *out_len);
@@ -390,6 +421,97 @@ model = RFModel({'task': 'regression', 'n_estimators': 200, 'seed': 42})
 model.fit(X_train, y_train)
 
 lower, upper = model.predict_interval(X_test, alpha=0.1)
+```
+
+### Sample weights
+
+Per-sample weights affect split criteria, leaf predictions, bootstrap sampling, and OOB scoring.
+
+```js
+const model = await RFModel.create({
+  nEstimators: 100, seed: 42,
+  sampleWeight: [1.0, 2.0, 1.0, 0.5, ...]  // per-sample weights
+})
+model.fit(X, y)
+
+// Or use classWeight: 'balanced' for auto-computed weights
+const balanced = await RFModel.create({
+  nEstimators: 100, classWeight: 'balanced', seed: 42
+})
+balanced.fit(X_imbalanced, y_imbalanced)
+```
+
+```python
+model = RFModel({
+    'n_estimators': 100, 'seed': 42,
+    'sample_weight': [1.0, 2.0, 1.0, 0.5, ...]
+})
+model.fit(X, y)
+
+# Or class_weight='balanced'
+balanced = RFModel({'n_estimators': 100, 'class_weight': 'balanced', 'seed': 42})
+balanced.fit(X_imbalanced, y_imbalanced)
+```
+
+### Histogram binning
+
+Pre-bins features into up to 256 quantile-spaced uint8 buckets. Split search becomes O(B) per feature instead of O(n). 5-50x speedup on large datasets. Auto-disabled for ExtraTrees mode.
+
+```js
+const model = await RFModel.create({
+  nEstimators: 200, histogramBinning: 1, seed: 42
+})
+model.fit(X_large, y_large)  // much faster for n > 10K
+```
+
+```python
+model = RFModel({'n_estimators': 200, 'histogram_binning': 1, 'seed': 42})
+model.fit(X_large, y_large)
+```
+
+### JARF rotation
+
+Jacobian Aligned Random Forests: trains a lightweight surrogate forest, computes finite-difference Jacobian per sample, forms EJOP matrix, eigendecomposes, and rotates features before training the main forest. Improves accuracy on rotated/diagonal decision boundaries.
+
+```js
+const model = await RFModel.create({
+  nEstimators: 200, jarf: 1, seed: 42
+})
+model.fit(X, y)  // rotation learned and applied automatically
+model.predict(X_test)  // rotation applied at prediction time too
+```
+
+```python
+model = RFModel({'n_estimators': 200, 'jarf': 1, 'seed': 42})
+model.fit(X, y)
+model.predict(X_test)
+```
+
+### Permutation importance
+
+Model-agnostic, unbiased feature importance. Shuffles each feature, re-predicts, measures score drop. Unlike MDI, unbiased toward high-cardinality features.
+
+```js
+const imp = model.permutationImportance(X_test, y_test, { nRepeats: 10, seed: 42 })
+// imp is Float64Array of length n_features
+```
+
+```python
+imp = model.permutation_importance(X_test, y_test, n_repeats=10, seed=42)
+# imp is numpy array of length n_features
+```
+
+### Proximity matrix
+
+Computes the fraction of trees where each pair of samples lands in the same leaf. Useful for outlier detection, clustering visualization, and missing value imputation.
+
+```js
+const prox = model.proximity(X)  // Float64Array of length nrow*nrow
+// prox[i * nrow + j] = fraction of trees where samples i and j share a leaf
+```
+
+```python
+prox = model.proximity(X)  # (nrow, nrow) numpy array
 ```
 
 ### Entropy criterion with sample rate
@@ -541,9 +663,10 @@ trends that constant leaves miss. The fit time is also lower due to fewer nodes.
 
 ## Serialization
 
-Models are serialized in a compact binary format (RF01 magic, format version 3).
-The format is backward-compatible: v3 readers can load v1/v2 files (new fields get defaults).
-v3 adds 1 byte per node for learned NaN direction.
+Models are serialized in a compact binary format (RF01 magic, format version 4).
+The format is backward-compatible: v4 readers can load v1/v2/v3 files (new fields get defaults).
+v3 adds 1 byte per node for learned NaN direction. v4 adds histogram flag, JARF flag, max_bins,
+and JARF rotation matrix storage.
 
 ```js
 // JS: wlearn bundle format (wraps RF binary in WLRN container)
@@ -573,7 +696,7 @@ rf_free_buffer(buf);
 mkdir build && cd build
 cmake .. -DBUILD_TESTING=ON
 make
-./test_rf                         # 85 tests
+./test_rf                         # 137 tests
 ```
 
 ### WASM
@@ -582,20 +705,20 @@ Requires Emscripten.
 
 ```bash
 bash scripts/build-wasm.sh        # outputs wasm/rf.js
-bash scripts/verify-exports.sh    # verifies 22 exports
+bash scripts/verify-exports.sh    # verifies 24 exports
 ```
 
 ### JS Tests
 
 ```bash
-node test/test.js                 # 39 tests
+node test/test.js                 # 43 tests
 ```
 
 ### Python Tests
 
 ```bash
-RF_LIB_PATH=build/librf.so python test/test_python.py       # 27 tests
-RF_LIB_PATH=build/librf.so python -m pytest test/test_parity.py -v  # 74 tests
+RF_LIB_PATH=build/librf.so python test/test_python.py       # 31 tests
+RF_LIB_PATH=build/librf.so python -m pytest test/test_parity.py -v  # 87 tests
 ```
 
 ### Benchmark
@@ -620,6 +743,10 @@ gcc -O2 -std=c11 -o build/benchmark test/benchmark.c csrc/rf.c -Icsrc -lm
   arXiv:2408.07151.
 - Horvath et al. (2025). "RaFFLE: Random Forest with Local Linear Extensions."
   arXiv:2502.10185.
+- Ke et al. (2017). "LightGBM: A Highly Efficient Gradient Boosting Decision
+  Tree." NeurIPS.
+- Rauniyar et al. (2025). "Jacobian Aligned Random Forests."
+  arXiv:2512.08306.
 
 ## License
 

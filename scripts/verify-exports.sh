@@ -35,6 +35,8 @@ EXPECTED_EXPORTS=(
   wl_rf_get_leaf_model
   wl_rf_predict_quantile
   wl_rf_predict_interval
+  wl_rf_permutation_importance
+  wl_rf_proximity
 )
 
 missing=0

@@ -107,7 +107,22 @@ typedef struct {
     int32_t    n_train;          /* number of training samples (for conformal) */
     const double *y_train;       /* pointer to training labels (NOT owned, set during fit) */
     double    *y_train_copy;     /* owned copy of training labels for conformal */
+    double    *sample_weight_copy; /* owned copy of sample weights (for weighted quantile) */
+    /* v0.4 fields */
+    double    *jarf_rotation;  /* ncol * ncol rotation matrix, NULL if no JARF */
+    int32_t    jarf_ncol;      /* columns in rotation matrix (must == n_features) */
 } rf_forest_t;
+
+/* ---------- Histogram binning ---------- */
+
+typedef struct {
+    uint8_t  *binned;     /* nrow * ncol, row-major: binned[i*ncol+j] = bin index for sample i, feature j */
+    double   *bin_edges;  /* ncol * (max_bins-1) thresholds: bin_edges[j*(max_bins-1)+k] */
+    int32_t  *n_bins;     /* per-feature actual bin count */
+    int32_t   max_bins;
+    int32_t   ncol;
+    int32_t   nrow;
+} rf_bins_t;
 
 /* ---------- Hyperparameters ---------- */
 
@@ -134,6 +149,14 @@ typedef struct {
     /* v0.3 params */
     int32_t *monotonic_cst;      /* per-feature constraints: -1=decreasing, 0=none, +1=increasing */
     int32_t  n_monotonic_cst;    /* length of monotonic_cst array (must equal ncol) */
+    /* v0.4 params */
+    double  *sample_weight;      /* per-sample weights (NULL = uniform), length nrow */
+    int32_t  n_sample_weight;    /* length of sample_weight array (must equal nrow) */
+    int32_t  histogram;          /* 0=off, 1=histogram binning for split search */
+    int32_t  max_bins;           /* max histogram bins (2-256), default 256 */
+    int32_t  jarf;               /* 0=off, 1=JARF rotation (Jacobian Aligned RF) */
+    int32_t  jarf_n_estimators;  /* surrogate RF trees, default 50 */
+    int32_t  jarf_max_depth;     /* surrogate RF max depth, default 6 */
 } rf_params_t;
 
 /* ---------- Public API ---------- */
@@ -205,6 +228,28 @@ int rf_predict_interval(
     double alpha,
     double *out_lower,
     double *out_upper
+);
+
+/* Permutation feature importance (model-agnostic, unbiased).
+ * For each feature, shuffles it n_repeats times, re-predicts, measures score drop.
+ * out: float64 array of length ncol, caller-allocated.
+ * Returns 0 on success, -1 on error. */
+int rf_permutation_importance(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    const double *y, int32_t n_repeats, uint32_t seed,
+    double *out
+);
+
+/* Compute proximity matrix.
+ * For each pair of samples, counts how often they land in the same leaf.
+ * out: float64 array of length nrow * nrow, caller-allocated.
+ * Row-major: out[i * nrow + j] = proximity(i, j) in [0, 1].
+ * Returns 0 on success, -1 on error. */
+int rf_proximity(
+    const rf_forest_t *forest,
+    const double *X, int32_t nrow, int32_t ncol,
+    double *out
 );
 
 /* Free forest and all owned memory. */

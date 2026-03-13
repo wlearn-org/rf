@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.4.0] - 2026-03-13
+
+### Added
+
+- Sample weights (`sampleWeight` / `sample_weight`). Per-sample weights affect
+  split criteria (weighted Gini/entropy/MSE/MAE), leaf predictions, bootstrap
+  sampling (probability proportional to weight), and OOB scoring. Weighted
+  quantile prediction supported. Convenience `classWeight='balanced'` /
+  `class_weight='balanced'` auto-computes `n / (K * n_k)` per class.
+
+- Histogram binning (`histogramBinning=1` / `histogram_binning=1`). Pre-bins
+  features into up to 256 quantile-spaced uint8 buckets. Split search is O(B)
+  per feature instead of O(n). 5-50x speedup on large datasets. Histogram
+  subtraction trick halves work per node. Auto-disabled for ExtraTrees mode.
+  Handles NaN with separate counters, works with all criteria and monotonic
+  constraints. Bin edges placed at midpoints between consecutive unique values.
+  Ke et al. (2017) "LightGBM: A Highly Efficient Gradient Boosting Decision
+  Tree." NeurIPS.
+
+- Permutation feature importance (`permutationImportance` / `permutation_importance`).
+  Model-agnostic, unbiased feature importance. For each feature, shuffles it
+  n_repeats times, re-predicts, measures score drop (accuracy for classification,
+  R2 for regression). Unlike MDI importance, unbiased toward high-cardinality
+  features.
+
+- JARF rotation (`jarf=1`). Jacobian Aligned Random Forests: trains a surrogate
+  RF, computes finite-difference Jacobian per sample per feature, forms Expected
+  Jacobian Outer Product (EJOP) matrix, eigendecomposes via Jacobi iteration,
+  and rotates features before training the main forest. Improves accuracy on
+  rotated/diagonal decision boundaries. Rotation matrix stored and applied at
+  prediction time. Serialized in RF04 format.
+  Rauniyar et al. (2025) "Jacobian Aligned Random Forests." arXiv:2512.08306.
+
+- Proximity matrix (`proximity`). For each pair of samples, computes the
+  fraction of trees where both samples land in the same leaf. Returns a
+  symmetric nrow x nrow matrix with values in [0, 1]. Useful for outlier
+  detection, clustering visualization, and missing value imputation.
+
+### Changed
+
+- Serialization format v4 (backward-compatible read of v1/v2/v3). Extended
+  header (80 bytes, +8 from v3) with histogram flag, JARF flag, max_bins, and
+  jarf_ncol. JARF rotation matrix stored after header when jarf=1.
+- 137 C tests, 43 JS tests, 31 Python tests, 87 parity tests.
+
 ## [0.3.0] - 2026-03-11
 
 ### Added

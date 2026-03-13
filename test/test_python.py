@@ -495,10 +495,10 @@ def test_v2_round_trip():
     p1 = m.predict(X)
     blob = m.save_raw()
 
-    # Version field should be 3 (v0.3 with nan_dir per node)
+    # Version field should be 4 (v0.4 with histogram/jarf metadata)
     import struct
     ver = struct.unpack('<I', blob[4:8])[0]
-    assert ver == 3, f'expected format version 3, got {ver}'
+    assert ver == 4, f'expected format version 4, got {ver}'
 
     m2 = RFModel.load_raw(blob)
     p2 = m2.predict(X)
@@ -527,6 +527,80 @@ def test_defaults_unchanged():
     m2.dispose()
 
 test('Explicit defaults match implicit defaults', test_defaults_unchanged)
+
+
+# === Sample weight tests ===
+
+def test_sample_weight_cls():
+    X, y = make_cls_data(900, 100, 2)
+    # Upweight second half
+    sw = np.ones(100)
+    sw[50:] = 4.0
+    m = RFModel({'n_estimators': 50, 'seed': 42, 'sample_weight': sw})
+    m.fit(X, y)
+    acc = m.score(X, y)
+    assert acc > 0.9, f'weighted cls acc {acc} should be > 0.9'
+    m.dispose()
+
+test('sample_weight classification', test_sample_weight_cls)
+
+
+def test_sample_weight_reg():
+    rng = lcg(901)
+    X = np.zeros((60, 3))
+    y = np.zeros(60)
+    for i in range(60):
+        for j in range(3):
+            X[i, j] = rng() * 4
+        y[i] = 2 * X[i, 0] + X[i, 1]
+    sw = np.ones(60)
+    sw[:30] = 5.0
+    m = RFModel({'task': 'regression', 'n_estimators': 50, 'seed': 42, 'sample_weight': sw})
+    m.fit(X, y)
+    r2 = m.score(X, y)
+    assert r2 > 0.8, f'weighted reg r2 {r2} should be > 0.8'
+    m.dispose()
+
+test('sample_weight regression', test_sample_weight_reg)
+
+
+def test_sample_weight_uniform():
+    X, y = make_reg_data(902, 60, 3)
+    m1 = RFModel({'task': 'regression', 'n_estimators': 20, 'seed': 77})
+    m1.fit(X, y)
+    p1 = m1.predict(X)
+
+    sw = np.ones(60)
+    m2 = RFModel({'task': 'regression', 'n_estimators': 20, 'seed': 77, 'sample_weight': sw})
+    m2.fit(X, y)
+    p2 = m2.predict(X)
+
+    assert np.allclose(p1, p2, atol=1e-10), 'uniform weights should match no weights'
+    m1.dispose()
+    m2.dispose()
+
+test('sample_weight uniform == no weight', test_sample_weight_uniform)
+
+
+def test_class_weight_balanced():
+    rng = lcg(903)
+    X = np.zeros((100, 2))
+    y = np.zeros(100)
+    # 90 class-0, 10 class-1
+    for i in range(90):
+        X[i] = [rng() * 2, rng() * 2]
+        y[i] = 0
+    for i in range(90, 100):
+        X[i] = [3 + rng() * 2, 3 + rng() * 2]
+        y[i] = 1
+
+    m = RFModel({'n_estimators': 50, 'seed': 42, 'class_weight': 'balanced'})
+    m.fit(X, y)
+    acc = m.score(X, y)
+    assert acc > 0.9, f'balanced acc {acc} should be > 0.9'
+    m.dispose()
+
+test('class_weight balanced', test_class_weight_balanced)
 
 
 # === Summary ===
