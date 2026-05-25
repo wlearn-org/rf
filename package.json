@@ -62,5 +62,9 @@
     "node:path": "./src/empty.js",
     "node:crypto": "./src/empty.js",
     "ws": "./src/empty.js"
+  },
+  "homepage": "https://wlearn.org",
+  "bugs": {
+    "url": "https://github.com/wlearn-org/rf/issues"
   }
 }
