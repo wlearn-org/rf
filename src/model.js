@@ -103,9 +103,9 @@ class RFModel {
       if (leakRegistry) leakRegistry.unregister(this)
     }
 
-    const { data: xData, rows, cols } = this.#normalizeX(X)
+    let { data: xData, rows, cols } = this.#normalizeX(X)
     const yNorm = normalizeY(y)
-    const yData = yNorm instanceof Float64Array ? yNorm : new Float64Array(yNorm)
+    let yData = yNorm instanceof Float64Array ? yNorm : new Float64Array(yNorm)
 
     if (yData.length !== rows) {
       throw new Error(`y length (${yData.length}) does not match X rows (${rows})`)
@@ -114,14 +114,6 @@ class RFModel {
     const task = this.#taskEnum()
     const maxFeatures = resolveMaxFeatures(this.#params.maxFeatures, cols, task)
     const criterion = resolveCriterion(this.#params.criterion, task)
-
-    // Allocate X on WASM heap
-    const xPtr = wasm._malloc(xData.length * 8)
-    wasm.HEAPF64.set(xData, xPtr / 8)
-
-    // Allocate y on WASM heap
-    const yPtr = wasm._malloc(yData.length * 8)
-    wasm.HEAPF64.set(yData, yPtr / 8)
 
     // Monotonic constraints (int32 array on WASM heap)
     let monoPtr = 0
@@ -156,18 +148,56 @@ class RFModel {
       }
     }
     if (sampleWeight) {
-      const sw = sampleWeight instanceof Float64Array
+      let sw = sampleWeight instanceof Float64Array
         ? sampleWeight : new Float64Array(sampleWeight)
       if (sw.length !== rows) {
-        wasm._free(xPtr)
-        wasm._free(yPtr)
         if (monoPtr) wasm._free(monoPtr)
         throw new Error(`sampleWeight length (${sw.length}) does not match X rows (${rows})`)
       }
+
+      let positiveRows = 0
+      for (let i = 0; i < sw.length; i++) {
+        if (!Number.isFinite(sw[i]) || sw[i] < 0) {
+          if (monoPtr) wasm._free(monoPtr)
+          throw new Error('sampleWeight values must be finite and non-negative')
+        }
+        if (sw[i] > 0) positiveRows++
+      }
+      if (positiveRows === 0) {
+        if (monoPtr) wasm._free(monoPtr)
+        throw new Error('sampleWeight must contain at least one positive value')
+      }
+
+      if (positiveRows < rows) {
+        const filteredX = new Float64Array(positiveRows * cols)
+        const filteredY = new Float64Array(positiveRows)
+        const filteredSw = new Float64Array(positiveRows)
+        let outRow = 0
+        for (let row = 0; row < rows; row++) {
+          if (sw[row] <= 0) continue
+          filteredX.set(xData.subarray(row * cols, row * cols + cols), outRow * cols)
+          filteredY[outRow] = yData[row]
+          filteredSw[outRow] = sw[row]
+          outRow++
+        }
+        xData = filteredX
+        yData = filteredY
+        sw = filteredSw
+        rows = positiveRows
+      }
+
       nSw = rows
       swPtr = wasm._malloc(rows * 8)
       wasm.HEAPF64.set(sw, swPtr / 8)
     }
+
+    // Allocate X on WASM heap
+    const xPtr = wasm._malloc(xData.length * 8)
+    wasm.HEAPF64.set(xData, xPtr / 8)
+
+    // Allocate y on WASM heap
+    const yPtr = wasm._malloc(yData.length * 8)
+    wasm.HEAPF64.set(yData, yPtr / 8)
 
     const modelPtr = wasm._wl_rf_fit(
       xPtr, rows, cols,

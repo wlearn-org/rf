@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1] - 2026-05-25
+
+### Fixed
+
+- Depend on the CommonJS `@wlearn/core` package release so package-root
+  `require('@wlearn/rf')` works after a fresh install.
+- Publish browser aliases for Emscripten's Node-only glue paths so consumer
+  browser bundlers can bundle `@wlearn/rf` without custom aliases.
+- Remove the unused direct runtime dependency on `@wlearn/types`.
+- Ignore zero-weight samples before training so sample weights cannot let
+  discarded rows affect tree structure.
+
 ## [0.4.0] - 2026-03-13
 
 ### Added

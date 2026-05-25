@@ -1,6 +1,6 @@
 {
   "name": "@wlearn/rf",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Random Forest from scratch in C11, compiled to WebAssembly -- classification, regression, ExtraTrees, quantile RF, conformal prediction, histogram binning, JARF rotation, sample weights, proximity matrix",
   "type": "commonjs",
   "main": "src/index.js",
@@ -31,8 +31,7 @@
     "prepack": "node scripts/prepack.js"
   },
   "dependencies": {
-    "@wlearn/core": "0.1.0",
-    "@wlearn/types": "0.1.0"
+    "@wlearn/core": "0.2.0"
   },
   "keywords": [
     "random-forest",
@@ -57,5 +56,11 @@
   "devDependencies": {
     "esbuild": "^0.27.3",
     "playwright": "^1.58.2"
+  },
+  "browser": {
+    "node:fs": "./src/empty.js",
+    "node:path": "./src/empty.js",
+    "node:crypto": "./src/empty.js",
+    "ws": "./src/empty.js"
   }
 }
